@@ -1,0 +1,49 @@
+name: mess_sur
+description: "A new Flutter project."
+publish_to: 'none'
+version: 1.1.1+5
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  supabase_flutter: ^2.0.0
+  flutter_image_compress: ^2.3.0
+  cloudinary_public: ^0.23.1
+  cupertino_icons: ^1.0.8
+  image_picker: ^1.2.2
+  url_launcher: ^6.3.0
+  marquee: ^2.3.0
+  google_mobile_ads: ^5.3.1
+  cached_network_image: ^3.4.1
+  share_plus: ^12.0.0
+  video_player: ^2.11.1
+  video_compress: ^3.1.0
+  http: ^1.2.0
+  audioplayers: ^6.7.1
+  file_picker: ^10.1.2
+  flutter_linkify: ^6.0.0
+  visibility_detector: ^0.4.0+2
+  shared_preferences: ^2.2.3
+  image_cropper: ^8.0.0
+  flutter_local_notifications: ^17.0.0
+  flutter_bkash: ^1.0.1
+  sqflite: ^2.3.0
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.2
+
+flutter:
+  uses-material-design: true
+
+
+flutter_launcher_icons:
+  android: true   # 👈 Change this from "launcher_icon" to true
+  ios: true
+  image_path: "assets/icon/logo.png"
