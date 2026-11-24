@@ -8,7 +8,14 @@ import 'package:url_launcher/url_launcher.dart';
 import 'MemberLedgerScreen.dart';
 
 class ArchiveScreen extends StatefulWidget {
-  const ArchiveScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const ArchiveScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<ArchiveScreen> createState() => _ArchiveScreenState();
@@ -22,14 +29,25 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
   bool _isOfflineMode = false;
   List _archivedMembers = [];
   List _filteredArchivedMembers = [];
+  String? _resolvedMessId;
 
   // Local Cache Keys
   static const String _cacheArchiveKey = 'offline_cache_archive_members_list';
   static const String _cacheArchivePaymentsKey = 'offline_cache_archive_payments';
 
+  String _scopeKeyFor(String? messId, String userId) {
+    return (messId != null && messId.isNotEmpty) ? messId : userId;
+  }
+
+  String _archiveCacheKey(String scopeKey) => '${_cacheArchiveKey}_$scopeKey';
+  String _archivePaymentsCacheKey(String scopeKey) =>
+      '${_cacheArchivePaymentsKey}_$scopeKey';
+
   @override
   void initState() {
     super.initState();
+    _resolvedMessId =
+    (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
     _fetchArchivedMembers();
   }
 
@@ -39,17 +57,24 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
     super.dispose();
   }
 
-  Future<void> _cacheDataLocally(List archiveList, List paymentsList) async {
+  Future<void> _cacheDataLocally(
+      String scopeKey,
+      List archiveList,
+      List paymentsList,
+      ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cacheArchiveKey, jsonEncode(archiveList));
-    await prefs.setString(_cacheArchivePaymentsKey, jsonEncode(paymentsList));
+    await prefs.setString(_archiveCacheKey(scopeKey), jsonEncode(archiveList));
+    await prefs.setString(
+        _archivePaymentsCacheKey(scopeKey), jsonEncode(paymentsList));
   }
 
-  Future _loadCachedDataLocally() async {
+  Future _loadCachedDataLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final archiveStr = prefs.getString(_cacheArchiveKey);
-      final paymentsStr = prefs.getString(_cacheArchivePaymentsKey);
+      final archiveStr = prefs.getString(_archiveCacheKey(scopeKey)) ??
+          prefs.getString(_cacheArchiveKey);
+      final paymentsStr = prefs.getString(_archivePaymentsCacheKey(scopeKey)) ??
+          prefs.getString(_cacheArchivePaymentsKey);
       return {
         'archive': archiveStr != null ? jsonDecode(archiveStr) as List : [],
         'payments': paymentsStr != null ? jsonDecode(paymentsStr) as List : [],
@@ -72,23 +97,47 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
         return;
       }
 
+      String? targetMessId = _resolvedMessId;
+      String scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+
       List archiveList = [];
       List paymentsList = [];
 
       try {
-        // 1. Fetch archive records online
-        final archiveResponse = await _supabase
-            .from('mess_archive')
-            .select('id, name, parents_name, occupation, home_town, mobile_number, parents_mobile_number, floor, occupied_rooms, entry_date, month, advance_paid, due, remarks, exited_at, created_at, exit_date, empty_rooms, owner_id')
-            .eq('owner_id', currentUserId)
-            .order('exited_at', ascending: false);
+        if (targetMessId == null || targetMessId.isEmpty) {
+          final setupRow = await _supabase
+              .from('mess_setup')
+              .select('id')
+              .eq('owner_id', currentUserId)
+              .order('created_at', ascending: false)
+              .limit(1)
+              .maybeSingle();
+          targetMessId = setupRow?['id']?.toString();
+          if (targetMessId != null && targetMessId.isNotEmpty) {
+            _resolvedMessId = targetMessId;
+            scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+          }
+        }
 
+        // 1. Fetch archive records online scoped to mess_id when available
+        var archiveQuery = _supabase
+            .from('mess_archive')
+            .select(
+            'id, mess_id, name, parents_name, occupation, home_town, mobile_number, parents_mobile_number, floor, occupied_rooms, entry_date, month, advance_paid, due, remarks, exited_at, created_at, exit_date, empty_rooms, owner_id')
+            .eq('owner_id', currentUserId);
+
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          archiveQuery = archiveQuery.eq('mess_id', targetMessId);
+        }
+
+        final archiveResponse =
+        await archiveQuery.order('exited_at', ascending: false);
         archiveList = List.from(archiveResponse);
 
         if (archiveList.isNotEmpty) {
           final archivedIds = archiveList.map((m) => m['id']).toList();
 
-          // 2. Fetch payments online
+          // 2. Fetch payments online for those archived members
           final paymentsResponse = await _supabase
               .from('mess_member_payments')
               .select('*')
@@ -98,19 +147,17 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
           paymentsList = List.from(paymentsResponse);
         }
 
-        // Cache locally
-        await _cacheDataLocally(archiveList, paymentsList);
+        await _cacheDataLocally(scopeKey, archiveList, paymentsList);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        // Fallback to local cache quietly if offline
-        debugPrint("🌐 Network offline. Loading archived members from local cache... Error: $networkError");
-        final cached = await _loadCachedDataLocally();
-        archiveList = cached['archive']!;
-        paymentsList = cached['payments']!;
+        debugPrint(
+            "🌐 Network offline. Loading archived members from local cache... Error: $networkError");
+        final cached = await _loadCachedDataLocally(scopeKey);
+        archiveList = List.from(cached['archive'] ?? []);
+        paymentsList = List.from(cached['payments'] ?? []);
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
-      // 3. Attach payments locally to each member map
       for (var member in archiveList) {
         member['mess_member_payments'] = paymentsList
             .where((p) => p['member_id'] == member['id'])
@@ -138,7 +185,8 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Restore Member'),
-        content: Text('Do you want to restore ${member['name']} back to active members?'),
+        content: Text(
+            'Do you want to restore ${member['name']} back to active members?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -156,10 +204,14 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       try {
         final restoredData = Map<String, dynamic>.from(member);
         final archiveId = restoredData['id'];
+        final messId = restoredData['mess_id'] ?? _resolvedMessId;
 
         restoredData.remove('exited_at');
         restoredData.remove('created_at');
         restoredData.remove('mess_member_payments');
+        if (messId != null && messId.toString().isNotEmpty) {
+          restoredData['mess_id'] = messId;
+        }
 
         await _supabase.from('mess_members').upsert(restoredData);
         await _supabase.from('mess_archive').delete().eq('id', archiveId);
@@ -168,7 +220,9 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('${member['name']} has been successfully restored!')),
+            SnackBar(
+                content:
+                Text('${member['name']} has been successfully restored!')),
           );
         }
       } catch (e) {

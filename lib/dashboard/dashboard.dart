@@ -9,7 +9,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const DashboardScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -33,6 +40,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return email?.toLowerCase() == 'codninesx@gmail.com';
   }
 
+  String? get _activeMessId =>
+      (widget.messId != null && widget.messId!.isNotEmpty)
+          ? widget.messId
+          : null;
+
   @override
   void initState() {
     super.initState();
@@ -45,28 +57,44 @@ class _DashboardScreenState extends State<DashboardScreen> {
   static const String _cacheMembersKey = 'offline_cache_members';
   static const String _cachePaymentsKey = 'offline_cache_payments';
 
+  String _scopeKeyFor(String userId) => _activeMessId ?? userId;
+  String _roomsCacheKey(String scopeKey) => '${_cacheRoomsKey}_$scopeKey';
+  String _setupCacheKey(String scopeKey) => '${_cacheSetupKey}_$scopeKey';
+  String _membersCacheKey(String scopeKey) => '${_cacheMembersKey}_$scopeKey';
+  String _paymentsCacheKey(String scopeKey) => '${_cachePaymentsKey}_$scopeKey';
+
   /// Save fetched data to local SharedPreferences
   Future<void> _cacheDataLocally({
+    required String scopeKey,
     required List rooms,
     required List setup,
     required List members,
     required List payments,
   }) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cacheRoomsKey, jsonEncode(rooms));
-    await prefs.setString(_cacheSetupKey, jsonEncode(setup));
-    await prefs.setString(_cacheMembersKey, jsonEncode(members));
-    await prefs.setString(_cachePaymentsKey, jsonEncode(payments));
+    await prefs.setString(_roomsCacheKey(scopeKey), jsonEncode(rooms));
+    await prefs.setString(_setupCacheKey(scopeKey), jsonEncode(setup));
+    await prefs.setString(_membersCacheKey(scopeKey), jsonEncode(members));
+    await prefs.setString(_paymentsCacheKey(scopeKey), jsonEncode(payments));
   }
 
   /// Load cached data from local SharedPreferences when offline
-  Future _loadCachedDataLocally() async {
+  Future _loadCachedDataLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final rooms = jsonDecode(prefs.getString(_cacheRoomsKey) ?? '[]') as List;
-      final setup = jsonDecode(prefs.getString(_cacheSetupKey) ?? '[]') as List;
-      final members = jsonDecode(prefs.getString(_cacheMembersKey) ?? '[]') as List;
-      final payments = jsonDecode(prefs.getString(_cachePaymentsKey) ?? '[]') as List;
+      final roomsStr =
+          prefs.getString(_roomsCacheKey(scopeKey)) ?? prefs.getString(_cacheRoomsKey);
+      final setupStr =
+          prefs.getString(_setupCacheKey(scopeKey)) ?? prefs.getString(_cacheSetupKey);
+      final membersStr = prefs.getString(_membersCacheKey(scopeKey)) ??
+          prefs.getString(_cacheMembersKey);
+      final paymentsStr = prefs.getString(_paymentsCacheKey(scopeKey)) ??
+          prefs.getString(_cachePaymentsKey);
+
+      final rooms = jsonDecode(roomsStr ?? '[]') as List;
+      final setup = jsonDecode(setupStr ?? '[]') as List;
+      final members = jsonDecode(membersStr ?? '[]') as List;
+      final payments = jsonDecode(paymentsStr ?? '[]') as List;
       return {
         'rooms': rooms,
         'setup': setup,
@@ -100,39 +128,62 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return;
       }
 
+      final targetMessId = _activeMessId;
+      final scopeKey = _scopeKeyFor(currentUserId);
+
       List roomsResponse = [];
       List setupResponse = [];
       List membersResponse = [];
       List paymentsResponse = [];
 
       try {
+        var roomsQuery =
+        _supabase.from('mess_rooms').select('*').eq('owner_id', currentUserId);
+        var setupQuery =
+        _supabase.from('mess_setup').select('*').eq('owner_id', currentUserId);
+        var membersQuery =
+        _supabase.from('mess_members').select('*').eq('owner_id', currentUserId);
+        var paymentsQuery = _supabase
+            .from('mess_member_payments')
+            .select(
+            'member_id, month_year, total_paid, rent_amount, electricity_bill, created_at, payment_date')
+            .eq('owner_id', currentUserId);
+
+        if (targetMessId != null) {
+          roomsQuery = roomsQuery.eq('mess_id', targetMessId);
+          setupQuery = setupQuery.eq('id', targetMessId);
+          membersQuery = membersQuery.eq('mess_id', targetMessId);
+        }
+
         final results = await Future.wait([
-          _supabase
-              .from('mess_rooms')
-              .select('*')
-              .eq('owner_id', currentUserId)
-              .order('created_at', ascending: true),
-          _supabase
-              .from('mess_setup')
-              .select('*')
-              .eq('owner_id', currentUserId),
-          _supabase
-              .from('mess_members')
-              .select('*')
-              .eq('owner_id', currentUserId)
-              .order('name', ascending: true),
-          _supabase
-              .from('mess_member_payments')
-              .select('member_id, month_year, total_paid, rent_amount, electricity_bill, created_at, payment_date')
-              .eq('owner_id', currentUserId),
+          roomsQuery.order('created_at', ascending: true),
+          setupQuery,
+          membersQuery.order('name', ascending: true),
+          paymentsQuery,
         ]);
 
-        roomsResponse = results[0] as List;
-        setupResponse = results[1] as List;
-        membersResponse = results[2] as List;
-        paymentsResponse = results[3] as List;
+        roomsResponse = List.from(results[0] as List);
+        setupResponse = List.from(results[1] as List);
+        membersResponse = List.from(results[2] as List);
+        paymentsResponse = List.from(results[3] as List);
+
+        if (targetMessId != null) {
+          final Set<String> messMemberIds = {
+            for (var m in membersResponse)
+              if (m['id'] != null) m['id'].toString(),
+          };
+          paymentsResponse = paymentsResponse.where((p) {
+            final pMessId = p['mess_id']?.toString();
+            if (pMessId != null && pMessId.isNotEmpty) {
+              return pMessId == targetMessId;
+            }
+            final mId = p['member_id']?.toString();
+            return mId != null && messMemberIds.contains(mId);
+          }).toList();
+        }
 
         await _cacheDataLocally(
+          scopeKey: scopeKey,
           rooms: roomsResponse,
           setup: setupResponse,
           members: membersResponse,
@@ -143,7 +194,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       } catch (e) {
         debugPrint("Error fetching dashboard data (falling back to cache): $e");
 
-        final cachedData = await _loadCachedDataLocally();
+        final cachedData = await _loadCachedDataLocally(scopeKey);
         roomsResponse = cachedData['rooms'] ?? [];
         setupResponse = cachedData['setup'] ?? [];
         membersResponse = cachedData['members'] ?? [];
@@ -167,7 +218,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
       }
 
-      String _getMonthName(int month) {
+      String getMonthName(int month) {
         const months = [
           'January', 'February', 'March', 'April', 'May', 'June',
           'July', 'August', 'September', 'October', 'November', 'December'
@@ -175,7 +226,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return months[month - 1];
       }
 
-      String _getShortMonthName(int month) {
+      String getShortMonthName(int month) {
         const months = [
           'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
@@ -185,11 +236,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       // --- CALCULATIONS ---
       int configuredRoomsSum = 0;
-      double setupElectricityBillShare = 0;
+      double fallbackElectricityBillShare = 0;
+      final Map<String, double> elecShareByMessId = {};
 
       for (var row in setupResponse) {
         configuredRoomsSum += (row['total_rooms'] as num?)?.toInt() ?? 0;
-        setupElectricityBillShare += (row['monthly_electricity_bill'] as num?)?.toDouble() ?? 0;
+        final double billShare =
+            (row['monthly_electricity_bill'] as num?)?.toDouble() ?? 0;
+        final rowId = row['id']?.toString();
+        if (rowId != null && rowId.isNotEmpty) {
+          elecShareByMessId[rowId] = billShare;
+        }
+        if (setupResponse.length == 1) {
+          fallbackElectricityBillShare = billShare;
+        }
       }
 
       double allTimePayments = 0;
@@ -218,10 +278,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       double calculatedDue = 0;
       for (var member in membersResponse) {
         final memberId = member['id']?.toString().trim();
+        final memberMessId = member['mess_id']?.toString().trim();
         final double profileDue = (member['due'] as num?)?.toDouble() ?? 0;
         final double expectedRent = (member['room_rent'] as num?)?.toDouble() ?? 0;
 
-        final double totalExpectedThisMonth = expectedRent + setupElectricityBillShare;
+        final double memberElecShare =
+        (memberMessId != null && elecShareByMessId.containsKey(memberMessId))
+            ? elecShareByMessId[memberMessId]!
+            : fallbackElectricityBillShare;
+
+        final double totalExpectedThisMonth = expectedRent + memberElecShare;
         double memberPaidThisMonth = 0.0;
 
         for (var p in paymentsResponse) {
@@ -229,19 +295,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
           if (paymentMemberId != null && paymentMemberId == memberId) {
             final rawDate = p['payment_date'] ?? p['created_at'];
-            final monthYearStr = (p['month_year'] ?? '').toString().toLowerCase().trim();
+            final monthYearStr =
+            (p['month_year'] ?? '').toString().toLowerCase().trim();
             bool isThisMonth = false;
 
             if (rawDate != null) {
               final parsedDate = DateTime.tryParse(rawDate.toString());
-              if (parsedDate != null && parsedDate.year == now.year && parsedDate.month == now.month) {
+              if (parsedDate != null &&
+                  parsedDate.year == now.year &&
+                  parsedDate.month == now.month) {
                 isThisMonth = true;
               }
             }
 
             if (!isThisMonth && monthYearStr.isNotEmpty) {
-              final currentMonthName = _getMonthName(now.month).toLowerCase();
-              final currentShortName = _getShortMonthName(now.month).toLowerCase();
+              final currentMonthName = getMonthName(now.month).toLowerCase();
+              final currentShortName = getShortMonthName(now.month).toLowerCase();
               final currentYearStr = now.year.toString();
 
               if (monthYearStr.contains(currentYearStr) &&
@@ -262,7 +331,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
 
         double unpaidThisMonth = totalExpectedThisMonth > 0
-            ? (totalExpectedThisMonth - memberPaidThisMonth).clamp(0.0, double.infinity)
+            ? (totalExpectedThisMonth - memberPaidThisMonth)
+            .clamp(0.0, double.infinity)
             : 0.0;
 
         double memberTotalDue = profileDue + unpaidThisMonth;

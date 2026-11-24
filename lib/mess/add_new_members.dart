@@ -4,7 +4,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AddMembersScreen extends StatefulWidget {
-  const AddMembersScreen({super.key});
+  final String? messId;
+  final String? initialRoomNo;
+  final int? initialFloor;
+  const AddMembersScreen({
+    super.key,
+    this.messId,
+    this.initialRoomNo,
+    this.initialFloor,
+  });
 
   @override
   State<AddMembersScreen> createState() => _AddMembersScreenState();
@@ -37,12 +45,24 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
 
   // Local Cache Keys
   static const String _cacheMembersKey = 'offline_cache_show_members_list';
+  String _membersCacheKeyForMess(String? messId, String ownerId) {
+    final scope = (messId != null && messId.isNotEmpty) ? messId : ownerId;
+    return '${_cacheMembersKey}_$scope';
+  }
 
   @override
   void initState() {
     super.initState();
-    _selectedEntryDate = DateTime.now();
+    final now = DateTime.now();
+    _selectedEntryDate = now;
     _entryDateController.text = _formatDate(_selectedEntryDate!);
+
+    _monthOptions = _buildMonthOptions(now);
+    final defaultMonth = '${_monthNames[now.month - 1]} ${now.year}';
+    _selectedMonth = _monthOptions.contains(defaultMonth)
+        ? defaultMonth
+        : _monthOptions.first;
+    _monthController.text = _selectedMonth!;
   }
 
   @override
@@ -64,6 +84,35 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
     super.dispose();
   }
 
+  static const List<String> _monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+
+  late final List<String> _monthOptions;
+  String? _selectedMonth;
+
+  List<String> _buildMonthOptions(DateTime anchorDate) {
+    final Set<String> uniqueMonths = {};
+    for (final y in [anchorDate.year, anchorDate.year + 1]) {
+      for (final m in _monthNames) {
+        uniqueMonths.add('$m $y');
+      }
+    }
+    return uniqueMonths.toList();
+  }
+
+
   String _formatDate(DateTime date) {
     return "${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}";
   }
@@ -84,13 +133,27 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
   }
 
   // Helper to save new member locally into SharedPreferences cache when offline
-  Future<void> _cacheNewMemberLocally(Map<String, dynamic> newMember) async {
+  Future<void> _cacheNewMemberLocally(
+      Map<String, dynamic> newMember, {
+        String? messId,
+        required String ownerId,
+      }) async {
     final prefs = await SharedPreferences.getInstance();
     try {
+      // 1. Update general cached members list
       final cachedStr = prefs.getString(_cacheMembersKey);
-      List membersList = cachedStr != null ? jsonDecode(cachedStr) as List : [];
-      membersList.insert(0, newMember); // Add to top
+      final List membersList =
+      cachedStr != null ? List.from(jsonDecode(cachedStr) as List) : [];
+      membersList.insert(0, newMember);
       await prefs.setString(_cacheMembersKey, jsonEncode(membersList));
+
+      // 2. Also update mess-scoped cache if messId is known
+      final scopedKey = _membersCacheKeyForMess(messId, ownerId);
+      final scopedStr = prefs.getString(scopedKey);
+      final List scopedList =
+      scopedStr != null ? List.from(jsonDecode(scopedStr) as List) : [];
+      scopedList.insert(0, newMember);
+      await prefs.setString(scopedKey, jsonEncode(scopedList));
     } catch (e) {
       debugPrint("Error caching new member locally: $e");
     }
@@ -111,12 +174,21 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
 
       final roomNumber = _roomNumberController.text.trim();
       final floorNumber = int.tryParse(_floorController.text.trim()) ?? 1;
-      final double advanceAmount = double.tryParse(_advancePaidController.text.trim()) ?? 0;
-      final double dueAmount = double.tryParse(_dueController.text.trim()) ?? 0;
-      final double roomRentAmount = double.tryParse(_roomRentController.text.trim()) ?? 0;
+      final double advanceAmount =
+          double.tryParse(_advancePaidController.text.trim()) ?? 0;
+      final double dueAmount =
+          double.tryParse(_dueController.text.trim()) ?? 0;
+      final double roomRentAmount =
+          double.tryParse(_roomRentController.text.trim()) ?? 0;
 
-      final newMemberData = {
-        'id': DateTime.now().millisecondsSinceEpoch.toString(), // Temporary offline ID fallback
+      String? activeMessId =
+      (widget.messId != null && widget.messId!.isNotEmpty)
+          ? widget.messId
+          : null;
+
+      final newMemberData = <String, dynamic>{
+        'id': DateTime.now().millisecondsSinceEpoch.toString(),
+        if (activeMessId != null) 'mess_id': activeMessId,
         'owner_id': currentUserId,
         'name': _nameController.text.trim(),
         'parents_name': _parentsNameController.text.trim(),
@@ -136,27 +208,59 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
       };
 
       try {
-        // 1. Auto-create room if it doesn't exist (online)
-        if (roomNumber.isNotEmpty) {
-          final existingRoom = await supabase
-              .from('mess_rooms')
+        if (activeMessId == null) {
+          final setupRow = await supabase
+              .from('mess_setup')
               .select('id')
               .eq('owner_id', currentUserId)
-              .eq('occupied_rooms', roomNumber)
+              .order('created_at', ascending: false)
+              .limit(1)
               .maybeSingle();
-
-          if (existingRoom == null) {
-            await supabase.from('mess_rooms').insert({
-              'owner_id': currentUserId,
-              'occupied_rooms': roomNumber,
-              'floor': floorNumber,
-              'room_type': 'double',
-            });
+          activeMessId = setupRow?['id']?.toString();
+          if (activeMessId != null && activeMessId.isNotEmpty) {
+            newMemberData['mess_id'] = activeMessId;
           }
         }
 
-        // 2. Insert member online and grab actual generated UUID
-        final memberResponse = await supabase.from('mess_members').insert({
+        // 1. Auto-create or mark room occupied (online), scoped by mess_id
+        if (roomNumber.isNotEmpty) {
+          var roomLookup = supabase
+              .from('mess_rooms')
+              .select('id')
+              .eq('occupied_rooms', roomNumber);
+
+          if (activeMessId != null && activeMessId.isNotEmpty) {
+            roomLookup = roomLookup.eq('mess_id', activeMessId);
+          } else {
+            roomLookup = roomLookup.eq('owner_id', currentUserId);
+          }
+
+          final existingRoom = await roomLookup.maybeSingle();
+
+          if (existingRoom == null) {
+            await supabase.from('mess_rooms').insert({
+              if (activeMessId != null && activeMessId.isNotEmpty)
+                'mess_id': activeMessId,
+              'owner_id': currentUserId,
+              'occupied_rooms': roomNumber,
+              'empty_rooms': roomNumber,
+              'floor': floorNumber,
+              'is_occupied': true,
+            });
+          } else {
+            await supabase
+                .from('mess_rooms')
+                .update({'is_occupied': true})
+                .eq('id', existingRoom['id']);
+          }
+        }
+
+        // 2. Insert member online with mess_id and grab actual generated UUID
+        final memberResponse = await supabase
+            .from('mess_members')
+            .insert({
+          if (activeMessId != null && activeMessId.isNotEmpty)
+            'mess_id': activeMessId,
           'owner_id': currentUserId,
           'name': newMemberData['name'],
           'parents_name': newMemberData['parents_name'],
@@ -172,18 +276,35 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
           'due': dueAmount,
           'remarks': newMemberData['remarks'],
           'room_rent': roomRentAmount,
-        }).select().single();
+        })
+            .select()
+            .single();
 
         newMemberData['id'] = memberResponse['id'];
+        if (memberResponse['mess_id'] != null) {
+          newMemberData['mess_id'] = memberResponse['mess_id'];
+        }
         if (mounted) setState(() => _isOfflineMode = false);
-      } catch (networkError) {
-        // Network offline -> Handle gracefully via local cache
-        debugPrint("🌐 Network offline. Saving new member to local cache... Error: $networkError");
-        if (mounted) setState(() => _isOfflineMode = true);
+      } catch (networkError, stackTrace) {
+        debugPrint("❌ AddMembersScreen cloud save failed: $networkError");
+        debugPrint("$stackTrace");
+        if (mounted) {
+          setState(() => _isOfflineMode = true);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Cloud save failed: $networkError'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
       }
 
-      // Always save to local cache so it appears immediately on list screens
-      await _cacheNewMemberLocally(newMemberData);
+      await _cacheNewMemberLocally(
+        newMemberData,
+        messId: activeMessId,
+        ownerId: currentUserId,
+      );
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -434,24 +555,56 @@ class _AddMembersScreenState extends State<AddMembersScreen> {
                     : null,
               ),
               const SizedBox(height: 16),
-
-              // Month Field
-              TextFormField(
-                controller: _monthController,
-                style: const TextStyle(color: Colors.black87),
+              // Month Dropdown Field
+              DropdownButtonFormField<String>(
+                value: _selectedMonth,
+                isDense: true,
+                isExpanded: true,
+                itemHeight: 48,
+                menuMaxHeight: 240,
+                borderRadius: BorderRadius.circular(12),
+                dropdownColor: Colors.white,
+                style: const TextStyle(color: Colors.black87, fontSize: 13),
                 decoration: InputDecoration(
-                  labelText: 'Month (e.g., November 2026)',
-                  labelStyle: TextStyle(color: Colors.grey[600]),
+                  labelText: 'Month',
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  labelStyle: TextStyle(color: Colors.grey[600], fontSize: 13),
                   border: const OutlineInputBorder(),
                   enabledBorder: OutlineInputBorder(
                     borderSide: BorderSide(color: Colors.grey[400]!),
                   ),
-                  prefixIcon: const Icon(Icons.date_range, color: Colors.blue),
+                  prefixIcon: const Icon(
+                    Icons.date_range,
+                    color: Colors.blue,
+                    size: 20,
+                  ),
                   filled: true,
                   fillColor: Colors.white,
                 ),
-                validator: (value) => value == null || value.trim().isEmpty
-                    ? 'Please enter month'
+                items: _monthOptions
+                    .map(
+                      (monthLabel) => DropdownMenuItem<String>(
+                    value: monthLabel,
+                    child: Text(
+                      monthLabel,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                )
+                    .toList(),
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() {
+                    _selectedMonth = value;
+                    _monthController.text = value;
+                  });
+                },
+                validator: (value) => (value == null || value.trim().isEmpty)
+                    ? 'Please select month'
                     : null,
               ),
               const SizedBox(height: 16),

@@ -5,7 +5,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class ElectricBillDetailsScreen extends StatefulWidget {
-  const ElectricBillDetailsScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const ElectricBillDetailsScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<ElectricBillDetailsScreen> createState() =>
@@ -28,6 +35,7 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
   bool _isOfflineMode = false;
   bool _applyToAllMembers = true;
 
+  String? _resolvedMessId;
   Map<String, List<dynamic>> _groupedBills = {};
   int _activeMemberCount = 0;
   double _totalBilledAmount = 0.0;
@@ -37,9 +45,18 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
   static const String _cacheBillsKey = 'offline_cache_electricity_bills';
   static const String _prefSyncToggleKey = 'pref_electricity_sync_toggle';
 
+  String _scopeKeyFor(String? messId, String userId) {
+    return (messId != null && messId.isNotEmpty) ? messId : userId;
+  }
+
+  String _billsCacheKey(String scopeKey) => '${_cacheBillsKey}_$scopeKey';
+  String _syncToggleKey(String scopeKey) => '${_prefSyncToggleKey}_$scopeKey';
+
   @override
   void initState() {
     super.initState();
+    _resolvedMessId =
+    (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
     _dateController.text = _formatDate(_selectedDate);
     _monthController.text = '${_getMonthName(_selectedDate.month)} ${_selectedDate.year}';
     _loadSavedPreferences();
@@ -58,9 +75,13 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
 
   Future<void> _loadSavedPreferences() async {
     final prefs = await SharedPreferences.getInstance();
+    final userId = _supabase.auth.currentUser?.id;
+    final scope = _scopeKeyFor(_resolvedMessId, userId ?? 'default');
+    final savedValue =
+        prefs.getBool(_syncToggleKey(scope)) ?? prefs.getBool(_prefSyncToggleKey);
     if (mounted) {
       setState(() {
-        _applyToAllMembers = prefs.getBool(_prefSyncToggleKey) ?? true;
+        _applyToAllMembers = savedValue ?? true;
       });
     }
   }
@@ -103,7 +124,25 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
       return;
     }
 
+    String? targetMessId = _resolvedMessId;
+    String scopeKey = _scopeKeyFor(targetMessId, userId);
+
     try {
+      if (targetMessId == null || targetMessId.isEmpty) {
+        final setupRow = await _supabase
+            .from('mess_setup')
+            .select('id')
+            .eq('owner_id', userId)
+            .order('created_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+        targetMessId = setupRow?['id']?.toString();
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          _resolvedMessId = targetMessId;
+          scopeKey = _scopeKeyFor(targetMessId, userId);
+        }
+      }
+
       final results = await Future.wait([
         _supabase
             .from('mess_electricity_bills')
@@ -112,12 +151,35 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
             .order('created_at', ascending: false),
         _supabase
             .from('mess_members')
-            .select('id, email')
+            .select('*')
             .eq('owner_id', userId),
       ]);
 
-      final bills = List.from(results[0] as List);
+      List bills = List.from(results[0] as List);
       List members = List.from(results[1] as List);
+
+      // Scope by mess_id when available, while preserving legacy rows where mess_id is null
+      if (targetMessId != null && targetMessId.isNotEmpty) {
+        final hasMessScopedBills = bills.any(
+              (b) => b['mess_id'] != null && b['mess_id'].toString().isNotEmpty,
+        );
+        if (hasMessScopedBills) {
+          bills = bills.where((b) {
+            final bMessId = b['mess_id']?.toString();
+            return bMessId == null || bMessId.isEmpty || bMessId == targetMessId;
+          }).toList();
+        }
+
+        final hasMessScopedMembers = members.any(
+              (m) => m['mess_id'] != null && m['mess_id'].toString().isNotEmpty,
+        );
+        if (hasMessScopedMembers) {
+          members = members.where((m) {
+            final mMessId = m['mess_id']?.toString();
+            return mMessId == null || mMessId.isEmpty || mMessId == targetMessId;
+          }).toList();
+        }
+      }
 
       if (userEmail != null && userEmail.isNotEmpty) {
         members = members.where((m) {
@@ -132,7 +194,6 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
 
       double totalAllTime = 0.0;
       double currentMonthTotal = 0.0;
-
       Map<String, List<dynamic>> grouped = {};
 
       for (int i = 0; i < bills.length; i++) {
@@ -140,25 +201,24 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
         final amount = (b['amount'] as num?)?.toDouble() ?? 0.0;
         totalAllTime += amount;
 
-        final monthYear = (b['month_year'] ?? 'Unknown Month').toString().trim();
-        if (!grouped.containsKey(monthYear)) {
-          grouped[monthYear] = [];
-        }
-        grouped[monthYear]!.add(b);
+        final monthYear =
+        (b['month_year'] ?? 'Unknown Month').toString().trim();
+        grouped.putIfAbsent(monthYear, () => []).add(b);
 
         final monthYearLower = monthYear.toLowerCase();
-        if (monthYearLower.contains(currentMonthName) && monthYearLower.contains(currentYearStr)) {
+        if (monthYearLower.contains(currentMonthName) &&
+            monthYearLower.contains(currentYearStr)) {
           currentMonthTotal += amount;
         }
       }
 
-      int activeMemberCount = members.length;
-      double calculatedPerMemberRate = activeMemberCount > 0
+      final int activeMemberCount = members.length;
+      final double calculatedPerMemberRate = activeMemberCount > 0
           ? double.parse((currentMonthTotal / activeMemberCount).toStringAsFixed(2))
           : 0.0;
 
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_cacheBillsKey, jsonEncode(bills));
+      await prefs.setString(_billsCacheKey(scopeKey), jsonEncode(bills));
 
       if (mounted) {
         setState(() {
@@ -172,35 +232,41 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
         });
       }
     } catch (e) {
-      debugPrint("Error loading electricity details (falling back to cache): $e");
+      debugPrint(
+          "Error loading electricity details (falling back to cache): $e");
       final prefs = await SharedPreferences.getInstance();
-      final cachedStr = prefs.getString(_cacheBillsKey);
-      final cachedBills = cachedStr != null ? jsonDecode(cachedStr) as List : [];
+      final cachedStr = prefs.getString(_billsCacheKey(scopeKey)) ??
+          prefs.getString(_cacheBillsKey);
+      final cachedBills =
+      cachedStr != null ? jsonDecode(cachedStr) as List : [];
 
       double totalAllTime = 0.0;
       double currentMonthTotal = 0.0;
       final now = DateTime.now();
       final currentMonthName = _getMonthName(now.month).toLowerCase();
       final currentYearStr = now.year.toString();
-
       Map<String, List<dynamic>> grouped = {};
 
       for (var b in cachedBills) {
         final amount = (b['amount'] as num?)?.toDouble() ?? 0.0;
         totalAllTime += amount;
-        final monthYear = (b['month_year'] ?? 'Unknown Month').toString().trim();
-        if (!grouped.containsKey(monthYear)) {
-          grouped[monthYear] = [];
-        }
-        grouped[monthYear]!.add(b);
+        final monthYear =
+        (b['month_year'] ?? 'Unknown Month').toString().trim();
+        grouped.putIfAbsent(monthYear, () => []).add(b);
 
         final monthYearLower = monthYear.toLowerCase();
-        if (monthYearLower.contains(currentMonthName) && monthYearLower.contains(currentYearStr)) {
+        if (monthYearLower.contains(currentMonthName) &&
+            monthYearLower.contains(currentYearStr)) {
           currentMonthTotal += amount;
         }
       }
 
-      double calculatedPerMemberRate = _activeMemberCount > 0 ? currentMonthTotal / _activeMemberCount : 0.0;
+      final int effectiveMemberCount =
+      _activeMemberCount > 0 ? _activeMemberCount : 0;
+      final double calculatedPerMemberRate = effectiveMemberCount > 0
+          ? double.parse(
+          (currentMonthTotal / effectiveMemberCount).toStringAsFixed(2))
+          : 0.0;
 
       if (mounted) {
         setState(() {
@@ -224,12 +290,10 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
     final billDate = _dateController.text.trim();
     final monthYear = _monthController.text.trim();
 
-    // Calculate preliminary per-member share for the confirmation dialog
     final double tempPerMemberShare = _activeMemberCount > 0
         ? double.parse((totalAmount / _activeMemberCount).toStringAsFixed(2))
         : totalAmount;
 
-    // --- CONFIRMATION DIALOG BEFORE SAVE ---
     final bool? confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -260,19 +324,33 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
       ),
     );
 
-    if (confirm != true) return; // Stop if the user cancels or dismisses the dialog
+    if (confirm != true) return;
 
     setState(() => _isSaving = true);
     try {
       final userId = _supabase.auth.currentUser?.id;
       if (userId == null) throw 'User not authenticated';
 
-      // Individual row per-member share for historical record tracking
+      String? targetMessId = _resolvedMessId;
+      if (targetMessId == null || targetMessId.isEmpty) {
+        final setupRow = await _supabase
+            .from('mess_setup')
+            .select('id')
+            .eq('owner_id', userId)
+            .order('created_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+        targetMessId = setupRow?['id']?.toString();
+        _resolvedMessId = targetMessId;
+      }
+
       final double singleRowPerMemberShare = _activeMemberCount > 0
           ? double.parse((totalAmount / _activeMemberCount).toStringAsFixed(2))
           : totalAmount;
 
       await _supabase.from('mess_electricity_bills').insert({
+        if (targetMessId != null && targetMessId.isNotEmpty)
+          'mess_id': targetMessId,
         'owner_id': userId,
         'meter_number': meterNumber,
         'floor': floorNumber,
@@ -285,12 +363,16 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
       _amountController.clear();
       await _fetchElectricityData();
 
-      // If toggle is active, sync the updated collective monthly rate to mess_setup
       if (_applyToAllMembers) {
-        await _supabase
+        var setupUpdate = _supabase
             .from('mess_setup')
-            .update({'monthly_electricity_bill': _latestPerMemberRate})
-            .eq('owner_id', userId);
+            .update({'monthly_electricity_bill': _latestPerMemberRate});
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          setupUpdate = setupUpdate.eq('id', targetMessId);
+        } else {
+          setupUpdate = setupUpdate.eq('owner_id', userId);
+        }
+        await setupUpdate;
       }
 
       if (mounted) {
@@ -309,7 +391,9 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
       debugPrint("Error saving electricity bill: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to save bill: $e'), backgroundColor: Colors.red),
+          SnackBar(
+              content: Text('Failed to save bill: $e'),
+              backgroundColor: Colors.red),
         );
       }
     } finally {
@@ -320,18 +404,24 @@ class _ElectricBillDetailsScreenState extends State<ElectricBillDetailsScreen> {
   Future<void> _toggleSyncToSetup(bool value) async {
     setState(() => _applyToAllMembers = value);
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_prefSyncToggleKey, value);
-
     final userId = _supabase.auth.currentUser?.id;
+    final scope = _scopeKeyFor(_resolvedMessId, userId ?? 'default');
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_syncToggleKey(scope), value);
+
     if (userId == null) return;
 
     try {
-      double rateToSync = value ? _latestPerMemberRate : 0.0;
-      await _supabase
+      final double rateToSync = value ? _latestPerMemberRate : 0.0;
+      var setupUpdate = _supabase
           .from('mess_setup')
-          .update({'monthly_electricity_bill': rateToSync})
-          .eq('owner_id', userId);
+          .update({'monthly_electricity_bill': rateToSync});
+      if (_resolvedMessId != null && _resolvedMessId!.isNotEmpty) {
+        setupUpdate = setupUpdate.eq('id', _resolvedMessId!);
+      } else {
+        setupUpdate = setupUpdate.eq('owner_id', userId);
+      }
+      await setupUpdate;
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

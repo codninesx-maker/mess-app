@@ -113,7 +113,7 @@ class _ViewMessDetailsScreenState extends State<ViewMessDetailsScreen> {
     final totalRooms = mess['total_rooms'] ?? 0;
     final rentPerRoom = mess['rent_per_room'] ?? 0;
     final advanceAmount = mess['advance_amount'] ?? 0;
-    final rules = mess['rules']?.toString() ?? 'N/A';
+    final remarks = mess['remarks']?.toString() ?? 'N/A';
     final createdAt = mess['created_at'] != null
         ? mess['created_at'].toString().split('T').first
         : 'N/A';
@@ -272,7 +272,7 @@ class _ViewMessDetailsScreenState extends State<ViewMessDetailsScreen> {
                     const Divider(height: 1),
                     _detailTile(Icons.account_balance_wallet_outlined, 'Advance Amount', ' $advanceAmount'),
                     const Divider(height: 1),
-                    _detailTile(Icons.rule_outlined, 'Mess Rules', rules),
+                    _detailTile(Icons.rule_outlined, 'Mess Rules', remarks),
                     const Divider(height: 1),
                     _detailTile(Icons.fingerprint, 'Owner ID (Last 6)', ownerId),
                   ],

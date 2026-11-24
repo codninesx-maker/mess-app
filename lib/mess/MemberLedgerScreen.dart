@@ -8,12 +8,16 @@ class MemberLedgerScreen extends StatefulWidget {
   final String memberId;
   final String memberName;
   final double initialAdvancePaid;
+  final String? messId;
+  final String? messName;
 
   const MemberLedgerScreen({
     super.key,
     required this.memberId,
     required this.memberName,
     this.initialAdvancePaid = 0,
+    this.messId,
+    this.messName,
   });
 
   @override
@@ -31,6 +35,9 @@ class _MemberLedgerScreenState extends State<MemberLedgerScreen> {
   String get _cacheAdvanceKey => 'offline_cache_ledger_advance_${widget.memberId}';
   String get _cachePaymentsKey => 'offline_cache_ledger_payments_${widget.memberId}';
   String get _syncQueueKey => 'offline_sync_queue_payments_${widget.memberId}';
+
+  String? get _activeMessId =>
+      (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
 
   @override
   void initState() {
@@ -73,22 +80,24 @@ class _MemberLedgerScreenState extends State<MemberLedgerScreen> {
 
       for (var payment in pendingQueue) {
         try {
-          // Remove temporary local ID before pushing to Supabase
-          final serverPayload = Map<String, dynamic>.from(payment);
+          final serverPayload = Map<String, dynamic>.from(payment as Map);
           serverPayload.remove('id');
           if (serverPayload['id'].toString().startsWith('local_')) {
             serverPayload.remove('id');
           }
+          if (_activeMessId != null &&
+              (serverPayload['mess_id'] == null ||
+                  serverPayload['mess_id'].toString().isEmpty)) {
+            serverPayload['mess_id'] = _activeMessId;
+          }
 
           await _supabase.from('mess_member_payments').insert(serverPayload);
         } catch (e) {
-          // If still failing, keep in queue
           remainingQueue.add(payment);
           debugPrint("Failed to sync individual payment: $e");
         }
       }
 
-      // Update sync queue with any failed items
       if (remainingQueue.isEmpty) {
         await prefs.remove(_syncQueueKey);
       } else {
@@ -109,32 +118,40 @@ class _MemberLedgerScreenState extends State<MemberLedgerScreen> {
         // 0. Try to sync any offline-created payments first if online
         await _syncPendingPayments();
 
-        // 1. Get Advance Deposit
+        // 1. Get Advance Deposit (scoped to mess_id when available)
         if (widget.initialAdvancePaid > 0) {
           fetchedAdvance = widget.initialAdvancePaid;
         } else {
-          final activeResponse = await _supabase
+          var activeQuery = _supabase
               .from('mess_members')
               .select('advance_paid')
-              .eq('id', widget.memberId)
-              .maybeSingle();
+              .eq('id', widget.memberId);
+          if (_activeMessId != null) {
+            activeQuery = activeQuery.eq('mess_id', _activeMessId!);
+          }
+          final activeResponse = await activeQuery.maybeSingle();
 
           if (activeResponse != null && activeResponse['advance_paid'] != null) {
             fetchedAdvance = (activeResponse['advance_paid'] as num).toDouble();
           } else {
-            final archiveResponse = await _supabase
+            var archiveQuery = _supabase
                 .from('mess_archive')
                 .select('advance_paid')
-                .eq('id', widget.memberId)
-                .maybeSingle();
+                .eq('id', widget.memberId);
+            if (_activeMessId != null) {
+              archiveQuery = archiveQuery.eq('mess_id', _activeMessId!);
+            }
+            final archiveResponse = await archiveQuery.maybeSingle();
 
-            if (archiveResponse != null && archiveResponse['advance_paid'] != null) {
-              fetchedAdvance = (archiveResponse['advance_paid'] as num).toDouble();
+            if (archiveResponse != null &&
+                archiveResponse['advance_paid'] != null) {
+              fetchedAdvance =
+                  (archiveResponse['advance_paid'] as num).toDouble();
             }
           }
         }
 
-        // 2. Fetch monthly payments online
+        // 2. Fetch monthly payments online for this member
         final paymentsResponse = await _supabase
             .from('mess_member_payments')
             .select('*')
@@ -143,12 +160,11 @@ class _MemberLedgerScreenState extends State<MemberLedgerScreen> {
 
         fetchedPayments = List.from(paymentsResponse);
 
-        // Cache fresh data locally
         await _cacheDataLocally(fetchedAdvance, fetchedPayments);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        // Fallback to local cache quietly if offline
-        debugPrint("🌐 Network offline. Loading ledger data from local cache... Error: $networkError");
+        debugPrint(
+            "🌐 Network offline. Loading ledger data from local cache... Error: $networkError");
         final cached = await _loadCachedDataLocally();
         fetchedAdvance = cached['advance'] as double;
         fetchedPayments = cached['payments'] as List;
@@ -182,15 +198,15 @@ class _MemberLedgerScreenState extends State<MemberLedgerScreen> {
 
   // Dialog to collect Rent + Electricity for a new month
   void _showAddMonthlyPaymentDialog() {
-    String selectedMonth = 'December'; // Default selected month
-    final rentController = TextEditingController();
-    final electricityController = TextEditingController();
-    final remarksController = TextEditingController();
-
     final List<String> months = [
       'January', 'February', 'March', 'April', 'May', 'June',
       'July', 'August', 'September', 'October', 'November', 'December'
     ];
+
+    String selectedMonth = months[DateTime.now().month - 1]; // Current month
+    final rentController = TextEditingController();
+    final electricityController = TextEditingController();
+    final remarksController = TextEditingController();
 
     showDialog(
       context: context,

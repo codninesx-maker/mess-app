@@ -4,7 +4,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class MessSetupScreen extends StatefulWidget {
-  const MessSetupScreen({super.key});
+  final String? messId;
+  final bool createNew;
+  const MessSetupScreen({
+    super.key,
+    this.messId,
+    this.createNew = false,
+  });
 
   @override
   State<MessSetupScreen> createState() => _MessSetupScreenState();
@@ -21,7 +27,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
   final _totalRoomsController = TextEditingController();
   final _advanceAmountController = TextEditingController();
   final _roomRentController = TextEditingController(); // Unified controller for room rent
-  final _rulesController = TextEditingController();
+  final _remarksController = TextEditingController();
 
   final Map<int, TextEditingController> _floorRoomCountControllers = {};
   final Map<int, TextEditingController> _floorRangeControllers = {};
@@ -56,7 +62,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
     _totalRoomsController.dispose();
     _advanceAmountController.dispose();
     _roomRentController.dispose(); // Properly disposed only once in dispose()
-    _rulesController.dispose();
+    _remarksController.dispose();
 
     for (var c in _floorRoomCountControllers.values) {
       c.dispose();
@@ -67,6 +73,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
 
     super.dispose();
   }
+
 
   Future<void> _cacheDataLocally(Map<String, dynamic>? setup, List rooms) async {
     final prefs = await SharedPreferences.getInstance();
@@ -226,6 +233,34 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
   }
 
   Future<void> _fetchExistingSetup() async {
+    if (widget.createNew) {
+      _existingConfigId = null;
+      _messNameController.clear();
+      _addressController.clear();
+      _contactPhoneController.clear();
+      _totalFloorsController.clear();
+      _totalRoomsController.clear();
+      _advanceAmountController.clear();
+      _roomRentController.clear();
+      _remarksController.clear();
+
+      for (final c in _floorRoomCountControllers.values) {
+        c.dispose();
+      }
+      for (final c in _floorRangeControllers.values) {
+        c.dispose();
+      }
+      _floorRoomCountControllers.clear();
+      _floorRangeControllers.clear();
+
+      if (mounted) {
+        setState(() {
+          _isOfflineMode = false;
+          _isFetchingInitialData = false;
+        });
+      }
+      return;
+    }
     try {
       final user = _supabase.auth.currentUser;
       final currentUserId = user?.id;
@@ -271,7 +306,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
           _totalRoomsController.text = setupResponse?['total_rooms']?.toString() ?? '1';
           _roomRentController.text = (setupResponse?['rent_per_room'] ?? setupResponse?['room_rent'])?.toString() ?? '0.0';
           _advanceAmountController.text = setupResponse?['advance_amount']?.toString() ?? '0.0';
-          _rulesController.text = setupResponse?['rules'] ?? '';
+          _remarksController.text = setupResponse?['remarks'] ?? '';
         });
       }
 
@@ -331,7 +366,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
         'total_rooms': totalRooms,
         'rent_per_room': double.tryParse(_roomRentController.text.trim()) ?? 0.0,
         'advance_amount': double.tryParse(_advanceAmountController.text.trim()) ?? 0.0,
-        'rules': _rulesController.text.trim(),
+        'remarks': _remarksController.text.trim(),
       };
 
       final customRooms = _generateCustomFloorRooms(totalFloors, currentUserId);
@@ -640,8 +675,8 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
               ),
               const SizedBox(height: 24),
               TextFormField(
-                controller: _rulesController,
-                maxLines: 4,
+                controller: _remarksController,
+                maxLines: 3,
                 decoration: const InputDecoration(
                   labelText: 'Remarks',
                   border: OutlineInputBorder(),
@@ -650,7 +685,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
                   fillColor: Colors.white,
                 ),
               ),
-              const SizedBox(height: 28),
+              const SizedBox(height: 24),
               SafeArea(
                 top: false,
                 child: SizedBox(
@@ -669,7 +704,7 @@ class _MessSetupScreenState extends State<MessSetupScreen> {
                       valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
                     )
                         : const Text(
-                      'Save Setup Configuration',
+                      'Save Mess Setup',
                       style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.bold,

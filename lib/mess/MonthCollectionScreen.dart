@@ -5,7 +5,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class MonthCollectionScreen extends StatefulWidget {
-  const MonthCollectionScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const MonthCollectionScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<MonthCollectionScreen> createState() => _MonthCollectionScreenState();
@@ -16,35 +23,59 @@ class _MonthCollectionScreenState extends State<MonthCollectionScreen> {
   bool _isLoading = true;
   bool _isOfflineMode = false;
   Map<String, Map<String, dynamic>> _groupedCollections = {};
+  String? _resolvedMessId;
 
   // Local Cache Keys
   static const String _cachePaymentsKey = 'offline_cache_month_collection_payments';
   static const String _cacheActiveMembersKey = 'offline_cache_month_collection_active_members';
   static const String _cacheArchivedMembersKey = 'offline_cache_month_collection_archived_members';
 
+  String _scopeKeyFor(String? messId, String userId) {
+    return (messId != null && messId.isNotEmpty) ? messId : userId;
+  }
+
+  String _paymentsCacheKey(String scopeKey) => '${_cachePaymentsKey}_$scopeKey';
+  String _activeCacheKey(String scopeKey) =>
+      '${_cacheActiveMembersKey}_$scopeKey';
+  String _archivedCacheKey(String scopeKey) =>
+      '${_cacheArchivedMembersKey}_$scopeKey';
+
   @override
   void initState() {
     super.initState();
+    _resolvedMessId =
+    (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
     _loadData();
   }
 
-  Future<void> _cacheDataLocally(List payments, List activeMembers, List archivedMembers) async {
+  Future<void> _cacheDataLocally(
+      String scopeKey,
+      List payments,
+      List activeMembers,
+      List archivedMembers,
+      ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cachePaymentsKey, jsonEncode(payments));
-    await prefs.setString(_cacheActiveMembersKey, jsonEncode(activeMembers));
-    await prefs.setString(_cacheArchivedMembersKey, jsonEncode(archivedMembers));
+    await prefs.setString(_paymentsCacheKey(scopeKey), jsonEncode(payments));
+    await prefs.setString(_activeCacheKey(scopeKey), jsonEncode(activeMembers));
+    await prefs.setString(
+        _archivedCacheKey(scopeKey), jsonEncode(archivedMembers));
   }
 
-  Future _loadCachedDataLocally() async {
+  Future _loadCachedDataLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final paymentsStr = prefs.getString(_cachePaymentsKey);
-      final activeStr = prefs.getString(_cacheActiveMembersKey);
-      final archivedStr = prefs.getString(_cacheArchivedMembersKey);
+      final paymentsStr = prefs.getString(_paymentsCacheKey(scopeKey)) ??
+          prefs.getString(_cachePaymentsKey);
+      final activeStr = prefs.getString(_activeCacheKey(scopeKey)) ??
+          prefs.getString(_cacheActiveMembersKey);
+      final archivedStr = prefs.getString(_archivedCacheKey(scopeKey)) ??
+          prefs.getString(_cacheArchivedMembersKey);
       return {
         'payments': paymentsStr != null ? jsonDecode(paymentsStr) as List : [],
-        'activeMembers': activeStr != null ? jsonDecode(activeStr) as List : [],
-        'archivedMembers': archivedStr != null ? jsonDecode(archivedStr) as List : [],
+        'activeMembers':
+        activeStr != null ? jsonDecode(activeStr) as List : [],
+        'archivedMembers':
+        archivedStr != null ? jsonDecode(archivedStr) as List : [],
       };
     } catch (e) {
       debugPrint("Error reading local month collections cache: $e");
@@ -74,41 +105,102 @@ class _MonthCollectionScreenState extends State<MonthCollectionScreen> {
       final currentUserId = _supabase.auth.currentUser?.id;
       if (currentUserId == null) return [];
 
+      String? targetMessId = _resolvedMessId;
+      String scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+
       List paymentsList = [];
       List activeMembersResponse = [];
       List archivedMembersResponse = [];
 
       try {
-        // 1. Fetch all monthly payments online
-        final paymentsResponse = await _supabase
+        if (targetMessId == null || targetMessId.isEmpty) {
+          final setupRow = await _supabase
+              .from('mess_setup')
+              .select('id')
+              .eq('owner_id', currentUserId)
+              .order('created_at', ascending: false)
+              .limit(1)
+              .maybeSingle();
+          targetMessId = setupRow?['id']?.toString();
+          if (targetMessId != null && targetMessId.isNotEmpty) {
+            _resolvedMessId = targetMessId;
+            scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+          }
+        }
+
+        var paymentsQuery = _supabase
             .from('mess_member_payments')
             .select('*')
-            .eq('owner_id', currentUserId)
-            .order('month_year', ascending: false);
-
-        paymentsList = List.from(paymentsResponse);
-
-        // 2. Fetch active and archived members online
-        activeMembersResponse = await _supabase
+            .eq('owner_id', currentUserId);
+        var activeQuery = _supabase
             .from('mess_members')
-            .select('id, name, occupied_rooms, floor')
+            .select('id, name, occupied_rooms, floor, mess_id')
             .eq('owner_id', currentUserId);
-
-        archivedMembersResponse = await _supabase
+        var archivedQuery = _supabase
             .from('mess_archive')
-            .select('id, name, occupied_rooms, floor')
+            .select('id, name, occupied_rooms, floor, mess_id')
             .eq('owner_id', currentUserId);
 
-        // Cache locally for offline use
-        await _cacheDataLocally(paymentsList, activeMembersResponse, archivedMembersResponse);
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          activeQuery = activeQuery.eq('mess_id', targetMessId);
+          archivedQuery = archivedQuery.eq('mess_id', targetMessId);
+        }
+
+        final results = await Future.wait([
+          paymentsQuery.order('month_year', ascending: false),
+          activeQuery,
+          archivedQuery,
+        ]);
+
+        paymentsList = List.from(results[0] as List);
+        activeMembersResponse = List.from(results[1] as List);
+        archivedMembersResponse = List.from(results[2] as List);
+
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          final Set<String> messMemberIds = {
+            for (var m in [...activeMembersResponse, ...archivedMembersResponse])
+              if (m['id'] != null) m['id'].toString(),
+          };
+          paymentsList = paymentsList.where((p) {
+            final pMessId = p['mess_id']?.toString();
+            if (pMessId != null && pMessId.isNotEmpty) {
+              return pMessId == targetMessId;
+            }
+            final mId = p['member_id']?.toString();
+            return mId != null && messMemberIds.contains(mId);
+          }).toList();
+        }
+
+        await _cacheDataLocally(
+          scopeKey,
+          paymentsList,
+          activeMembersResponse,
+          archivedMembersResponse,
+        );
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        // Fallback to local cache quietly if offline
-        debugPrint("🌐 Network offline. Loading month collections from local cache... Error: $networkError");
-        final cached = await _loadCachedDataLocally();
-        paymentsList = cached['payments'] ?? [];
-        activeMembersResponse = cached['activeMembers'] ?? [];
-        archivedMembersResponse = cached['archivedMembers'] ?? [];
+        debugPrint(
+            "🌐 Network offline. Loading month collections from local cache... Error: $networkError");
+        final cached = await _loadCachedDataLocally(scopeKey);
+        paymentsList = List.from(cached['payments'] ?? []);
+        activeMembersResponse = List.from(cached['activeMembers'] ?? []);
+        archivedMembersResponse = List.from(cached['archivedMembers'] ?? []);
+
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          final Set<String> messMemberIds = {
+            for (var m in [...activeMembersResponse, ...archivedMembersResponse])
+              if (m['id'] != null) m['id'].toString(),
+          };
+          paymentsList = paymentsList.where((p) {
+            final pMessId = p['mess_id']?.toString();
+            if (pMessId != null && pMessId.isNotEmpty) {
+              return pMessId == targetMessId;
+            }
+            final mId = p['member_id']?.toString();
+            return mId != null && messMemberIds.contains(mId);
+          }).toList();
+        }
+
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
@@ -117,11 +209,10 @@ class _MonthCollectionScreenState extends State<MonthCollectionScreen> {
       final Map<String, Map<String, dynamic>> memberMap = {};
       for (var m in [...activeMembersResponse, ...archivedMembersResponse]) {
         if (m['id'] != null) {
-          memberMap[m['id'].toString()] = m as Map<String, dynamic>;
+          memberMap[m['id'].toString()] = Map<String, dynamic>.from(m as Map);
         }
       }
 
-      // 3. Attach member details locally to each payment record
       for (var payment in paymentsList) {
         final memberId = payment['member_id']?.toString();
 

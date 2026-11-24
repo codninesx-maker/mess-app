@@ -4,9 +4,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class EditMessSetupScreen extends StatefulWidget {
+  final String? messId;
+  final bool createNew;
   final Map<String, dynamic> initialSetup;
 
-  const EditMessSetupScreen({super.key, required this.initialSetup});
+  const EditMessSetupScreen({super.key, required this.initialSetup, this.messId,
+    this.createNew = false,});
 
   @override
   State<EditMessSetupScreen> createState() => _EditMessSetupScreenState();
@@ -23,7 +26,7 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
   late final TextEditingController _totalRoomsController;
   late final TextEditingController _rentPerRoomController;
   late final TextEditingController _advanceAmountController;
-  late final TextEditingController _rulesController;
+  late final TextEditingController _remarksController;
   late final TextEditingController _roomRentController; // Fixed: Now declared as late final
 
   final Map<int, TextEditingController> _floorRoomCountControllers = {};
@@ -41,6 +44,14 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
   // Local Cache Keys
   static const String _cacheSetupKey = 'offline_cache_mess_setup_data';
   static const String _cacheRoomsKey = 'offline_cache_mess_setup_rooms';
+  String? get _effectiveMessId {
+    final raw = widget.messId ?? widget.initialSetup['id']?.toString();
+    final trimmed = raw?.trim();
+    return (trimmed != null && trimmed.isNotEmpty) ? trimmed : null;
+  }
+
+  String _setupCacheKeyFor(String scopeKey) => 'offline_cache_mess_setup_data_$scopeKey';
+  String _roomsCacheKeyFor(String scopeKey) => 'offline_cache_mess_setup_rooms_$scopeKey';
 
   @override
   void initState() {
@@ -53,7 +64,7 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
     _totalRoomsController = TextEditingController(text: s['total_rooms']?.toString() ?? '1');
     _rentPerRoomController = TextEditingController(text: s['rent_per_room']?.toString() ?? '0.0');
     _advanceAmountController = TextEditingController(text: s['advance_amount']?.toString() ?? '0.0');
-    _rulesController = TextEditingController(text: s['rules'] ?? '');
+    _remarksController = TextEditingController(text: s['remarks'] ?? '');
 
     // Fixed: Initialized _roomRentController properly using s['rent_per_room'] or default value
     _roomRentController = TextEditingController(text: s['rent_per_room']?.toString() ?? '0.0');
@@ -76,7 +87,7 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
     _totalRoomsController.dispose();
     _rentPerRoomController.dispose();
     _advanceAmountController.dispose();
-    _rulesController.dispose();
+    _remarksController.dispose();
     _roomRentController.dispose(); // Fixed: Disposed properly here
 
     for (var c in _floorRoomCountControllers.values) c.dispose();
@@ -85,15 +96,15 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
     super.dispose();
   }
 
-  Future<void> _cacheRoomsLocally(List rooms) async {
+  Future<void> _cacheRoomsLocally(String scopeKey, List rooms) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cacheRoomsKey, jsonEncode(rooms));
+    await prefs.setString(_roomsCacheKeyFor(scopeKey), jsonEncode(rooms));
   }
 
-  Future<List> _loadCachedRoomsLocally() async {
+  Future<List> _loadCachedRoomsLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final roomsStr = prefs.getString(_cacheRoomsKey);
+      final roomsStr = prefs.getString(_roomsCacheKeyFor(scopeKey));
       if (roomsStr != null) {
         return jsonDecode(roomsStr) as List;
       }
@@ -118,6 +129,45 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
       }
     }
     return allRooms;
+  }
+
+  List _generateCustomFloorRooms(
+      int totalFloors,
+      String currentUserId,
+      String? messId,
+      Set<String> occupiedRoomNumbers,
+      ) {
+    final List allGeneratedRooms = [];
+    for (int floorNum = 1; floorNum <= totalFloors; floorNum++) {
+      final countController = _floorRoomCountControllers[floorNum];
+      final inputText = (countController?.text ?? '').trim();
+      if (inputText.isEmpty) continue;
+
+      final int roomCount = int.tryParse(inputText) ?? 0;
+      if (roomCount <= 0) continue;
+
+      for (int seq = 1; seq <= roomCount; seq++) {
+        final String roomNo = "$floorNum${seq.toString().padLeft(2, '0')}";
+        final bool isOccupied = occupiedRoomNumbers.contains(roomNo);
+        allGeneratedRooms.add({
+          'owner_id': currentUserId,
+          if (messId != null && messId.isNotEmpty) 'mess_id': messId,
+          'occupied_rooms': roomNo,
+          'empty_rooms': isOccupied ? null : roomNo,
+          'is_occupied': isOccupied,
+          'floor': floorNum,
+          'room_type': 'double',
+        });
+      }
+    }
+    return allGeneratedRooms;
+  }
+
+  String _getFloorOrdinal(int f) {
+    if (f == 1) return '1st Floor';
+    if (f == 2) return '2nd Floor';
+    if (f == 3) return '3rd Floor';
+    return '${f}th Floor';
   }
 
   void _buildDefaultControllers(int floors, int rooms) {
@@ -161,6 +211,34 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
   }
 
   Future<void> _fetchExistingRooms() async {
+    if (widget.createNew) {
+      _messNameController.clear();
+      _addressController.clear();
+      _contactPhoneController.clear();
+      _totalFloorsController.clear();
+      _totalRoomsController.clear();
+      _rentPerRoomController.clear();
+      _advanceAmountController.clear();
+      _roomRentController.clear();
+      _remarksController.clear();
+
+      for (final c in _floorRoomCountControllers.values) {
+        c.dispose();
+      }
+      for (final c in _floorRangeControllers.values) {
+        c.dispose();
+      }
+      _floorRoomCountControllers.clear();
+      _floorRangeControllers.clear();
+
+      if (mounted) {
+        setState(() {
+          _isOfflineMode = false;
+          _isFetchingRooms = false;
+        });
+      }
+      return;
+    }
     try {
       final user = _supabase.auth.currentUser;
       final currentUserId = user?.id;
@@ -171,19 +249,23 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
 
       List roomsResponse = [];
 
-      try {
-        // Attempt online fetch
-        roomsResponse = await _supabase
-            .from('mess_rooms')
-            .select('*')
-            .eq('owner_id', currentUserId)
-            .order('floor', ascending: true);
+      final messId = _effectiveMessId;
+      final cacheScopeKey = messId ?? 'owner_$currentUserId';
 
-        await _cacheRoomsLocally(roomsResponse);
+      try {
+        var query = _supabase.from('mess_rooms').select('*');
+        if (messId != null) {
+          query = query.eq('mess_id', messId);
+        } else {
+          query = query.eq('owner_id', currentUserId);
+        }
+        roomsResponse = await query.order('floor', ascending: true);
+
+        await _cacheRoomsLocally(cacheScopeKey, roomsResponse);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
         debugPrint("🌐 Network offline. Loading rooms from local cache... Error: $networkError");
-        roomsResponse = await _loadCachedRoomsLocally();
+        roomsResponse = await _loadCachedRoomsLocally(cacheScopeKey);
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
@@ -220,38 +302,6 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
     }
   }
 
-  List _generateCustomFloorRooms(int totalFloors, String currentUserId) {
-    List allGeneratedRooms = [];
-    for (int floorNum = 1; floorNum <= totalFloors; floorNum++) {
-      final countController = _floorRoomCountControllers[floorNum];
-      final rawText = countController?.text ?? '';
-      final inputText = rawText.trim();
-      if (inputText.isEmpty) continue;
-
-      int roomCount = int.tryParse(inputText) ?? 0;
-      if (roomCount <= 0) continue;
-
-      for (int seq = 1; seq <= roomCount; seq++) {
-        String roomNo = "$floorNum${seq.toString().padLeft(2, '0')}";
-        allGeneratedRooms.add({
-          'owner_id': currentUserId,
-          'occupied_rooms': roomNo,
-          'empty_rooms': roomNo,
-          'floor': floorNum,
-          'room_type': 'double',
-        });
-      }
-    }
-    return allGeneratedRooms;
-  }
-
-  String _getFloorOrdinal(int f) {
-    if (f == 1) return '1st Floor';
-    if (f == 2) return '2nd Floor';
-    if (f == 3) return '3rd Floor';
-    return '${f}th Floor';
-  }
-
   Future<void> _updateMessSetup() async {
     if (!_formKey.currentState!.validate()) return;
 
@@ -272,13 +322,18 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
         'contact_phone': _contactPhoneController.text.trim(),
         'total_floors': totalFloors,
         'total_rooms': totalRooms,
-        'rent_per_room': double.tryParse(_roomRentController.text.trim()) ?? 0.0, // Updated to use room rent field value
+        'rent_per_room': double.tryParse(_roomRentController.text.trim()) ?? 0.0,
         'advance_amount': double.tryParse(_advanceAmountController.text.trim()) ?? 0.0,
-        'rules': _rulesController.text.trim(),
+        'remarks': _remarksController.text.trim(),
       };
 
-      final customRooms = _generateCustomFloorRooms(totalFloors, currentUserId);
-      final configId = widget.initialSetup['id'];
+      final String? configId =
+      (widget.messId ?? widget.initialSetup['id'])?.toString().trim();
+      if (configId == null || configId.isEmpty) {
+        throw 'Mess setup ID not found.';
+      }
+
+      List customRooms = [];
 
       try {
         await _supabase
@@ -287,26 +342,56 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
             .eq('id', configId)
             .eq('owner_id', currentUserId);
 
-        if (customRooms.isNotEmpty) {
-          await _supabase
-              .from('mess_rooms')
-              .delete()
-              .eq('owner_id', currentUserId);
+        // Only recreate rooms for THIS mess when floor/room layout was edited
+        if (_isEditingFloors) {
+          final membersRows = await _supabase
+              .from('mess_members')
+              .select('occupied_rooms')
+              .eq('mess_id', configId)
+              .not('occupied_rooms', 'is', null);
 
-          for (var roomData in customRooms) {
-            await _supabase.from('mess_rooms').insert(roomData);
+          final Set<String> occupiedRoomNumbers = (membersRows as List)
+              .map((m) => m['occupied_rooms']?.toString().trim() ?? '')
+              .where((r) => r.isNotEmpty)
+              .toSet();
+
+          customRooms = _generateCustomFloorRooms(
+            totalFloors,
+            currentUserId,
+            configId,
+            occupiedRoomNumbers,
+          );
+
+          if (customRooms.isNotEmpty) {
+            await _supabase
+                .from('mess_rooms')
+                .delete()
+                .eq('mess_id', configId);
+
+            await _supabase.from('mess_rooms').insert(customRooms);
           }
         }
+
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        debugPrint("🌐 Network offline while updating setup. Saving locally... Error: $networkError");
+        debugPrint(
+          "🌐 Network offline while updating setup. Saving locally... Error: $networkError",
+        );
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
-      // Cache locally
+      // Scope local cache by configId (mess_id)
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_cacheSetupKey, jsonEncode({...widget.initialSetup, ...payload}));
-      await _cacheRoomsLocally(customRooms);
+      await prefs.setString(
+        '${_cacheSetupKey}_$configId',
+        jsonEncode({...widget.initialSetup, ...payload}),
+      );
+      if (customRooms.isNotEmpty) {
+        await prefs.setString(
+          '${_cacheRoomsKey}_$configId',
+          jsonEncode(customRooms),
+        );
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -631,7 +716,7 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
               ],
               const SizedBox(height: 24),
 
-              // --- SECTION 3: FINANCIALS & RULES ---
+              // --- SECTION 3: FINANCIALS ---
               _buildSectionHeaderWithToggle(
                 title: 'Financials',
                 icon: Icons.payments,
@@ -698,9 +783,9 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
               ),
               const SizedBox(height: 24),
               TextFormField(
-                controller: _rulesController,
+                controller: _remarksController,
+                maxLines: 2,
                 readOnly: !_isEditingFinancials,
-                maxLines: 4,
                 style: TextStyle(
                   color: _isEditingFinancials ? Colors.black87 : Colors.grey[700],
                 ),
@@ -714,14 +799,14 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
                     ),
                   ),
                   prefixIcon: Icon(
-                    Icons.assignment,
+                    Icons.note,
                     color: _isEditingFinancials ? Colors.blue : Colors.grey[500],
                   ),
                   filled: true,
                   fillColor: !_isEditingFinancials ? Colors.grey[200]?.withOpacity(0.6) : Colors.white,
                 ),
               ),
-              const SizedBox(height: 28),
+              const SizedBox(height: 24),
 
               SafeArea(
                 top: false,
@@ -741,7 +826,7 @@ class _EditMessSetupScreenState extends State<EditMessSetupScreen> {
                       valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
                     )
                         : const Text(
-                      'Update Configuration',
+                      'Update Mess Setup',
                       style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                     ),
                   ),

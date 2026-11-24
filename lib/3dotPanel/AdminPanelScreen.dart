@@ -3,6 +3,8 @@ import 'package:mess_sur/3dotPanel/OthersScreen.dart';
 import 'package:mess_sur/3dotPanel/loged_in_members_list.dart';
 import 'package:mess_sur/3dotPanel/mess_owner_list.dart';
 
+import 'delete_mess_and_member.dart';
+
 
 
 class AdminMenuScreen extends StatelessWidget {
@@ -96,8 +98,45 @@ class AdminMenuScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-
-          // 3. Others (from others.dart)
+          // 3. New Navigation Button (Just Before Others)
+          Card(
+            elevation: 1,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: Colors.red.withOpacity(0.35)),
+            ),
+            child: ListTile(
+              contentPadding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.red.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.delete_forever, color: Colors.red),
+              ),
+              title: const Text(
+                'DeleteMessAndUser',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+              ),
+              subtitle: const Text(
+                'Permanently delete messes or individual members',
+                style: TextStyle(fontSize: 12),
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const DeleteMessAndMemberScreen(),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+          // 4. Others (from others.dart)
           Card(
             elevation: 1,
             shape: RoundedRectangleBorder(

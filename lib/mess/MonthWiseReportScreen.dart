@@ -6,7 +6,14 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'collection_utils.dart';
 
 class MonthWiseReportScreen extends StatefulWidget {
-  const MonthWiseReportScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const MonthWiseReportScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<MonthWiseReportScreen> createState() => _MonthWiseReportScreenState();
@@ -17,26 +24,36 @@ class _MonthWiseReportScreenState extends State<MonthWiseReportScreen> {
   bool _isLoading = true;
   bool _isOfflineMode = false;
   Map<String, Map<String, dynamic>> _groupedReport = {};
+  String? _resolvedMessId;
 
-  // Owner-scoped local cache key
-  String get _cacheReportKey =>
-      'offline_cache_month_wise_report_${_supabase.auth.currentUser?.id ?? 'default'}';
+  static const String _cacheReportKeyPrefix = 'offline_cache_month_wise_report';
+
+  String _ownerCacheKey(String userId) => '${_cacheReportKeyPrefix}_$userId';
+
+  String _cacheReportKeyFor(String scopeKey) =>
+      '${_cacheReportKeyPrefix}_$scopeKey';
 
   @override
   void initState() {
     super.initState();
+    _resolvedMessId =
+    (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
     _fetchAndGroupData();
   }
 
-  Future<void> _cacheReportLocally(List rawPayments) async {
+  Future<void> _cacheReportLocally(String scopeKey, List rawPayments) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cacheReportKey, jsonEncode(rawPayments));
+    await prefs.setString(_cacheReportKeyFor(scopeKey), jsonEncode(rawPayments));
   }
 
-  Future<List> _loadCachedReportLocally() async {
+  Future<List> _loadCachedReportLocally(
+      String scopeKey,
+      String currentUserId,
+      ) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final cachedStr = prefs.getString(_cacheReportKey);
+      final cachedStr = prefs.getString(_cacheReportKeyFor(scopeKey)) ??
+          prefs.getString(_ownerCacheKey(currentUserId));
       if (cachedStr != null) {
         return jsonDecode(cachedStr) as List;
       }
@@ -55,28 +72,72 @@ class _MonthWiseReportScreenState extends State<MonthWiseReportScreen> {
         return;
       }
 
+      String? targetMessId = _resolvedMessId;
+      String scopeKey =
+      (targetMessId != null && targetMessId.isNotEmpty)
+          ? targetMessId
+          : currentUserId;
+
       List rawList = [];
 
       try {
-        // Attempt online fetch strictly scoped to current owner
-        final paymentsResponse = await _supabase
-            .from('mess_member_payments')
-            .select('*, mess_members(name, occupied_rooms)')
-            .eq('owner_id', currentUserId);
+        if (targetMessId == null || targetMessId.isEmpty) {
+          final setupRow = await _supabase
+              .from('mess_setup')
+              .select('id')
+              .eq('owner_id', currentUserId)
+              .order('created_at', ascending: false)
+              .limit(1)
+              .maybeSingle();
+          targetMessId = setupRow?['id']?.toString();
+          if (targetMessId != null && targetMessId.isNotEmpty) {
+            _resolvedMessId = targetMessId;
+            scopeKey = targetMessId;
+          }
+        }
 
-        rawList = List.from(paymentsResponse);
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          // Scope to members belonging to this mess_id
+          final messMembersResponse = await _supabase
+              .from('mess_members')
+              .select('id')
+              .eq('owner_id', currentUserId)
+              .eq('mess_id', targetMessId);
 
-        // Save fresh data locally
-        await _cacheReportLocally(rawList);
+          final memberIds = (messMembersResponse as List)
+              .map((m) => m['id'])
+              .where((id) => id != null)
+              .toList();
+
+          if (memberIds.isEmpty) {
+            rawList = [];
+          } else {
+            final paymentsResponse = await _supabase
+                .from('mess_member_payments')
+                .select('*, mess_members(name, occupied_rooms)')
+                .eq('owner_id', currentUserId)
+                .filter('member_id', 'in', memberIds);
+
+            rawList = List.from(paymentsResponse);
+          }
+        } else {
+          final paymentsResponse = await _supabase
+              .from('mess_member_payments')
+              .select('*, mess_members(name, occupied_rooms)')
+              .eq('owner_id', currentUserId);
+
+          rawList = List.from(paymentsResponse);
+        }
+
+        await _cacheReportLocally(scopeKey, rawList);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        // Offline fallback without error snackbars
-        debugPrint("Network offline. Loading month-wise report from cache... Error: $networkError");
-        rawList = await _loadCachedReportLocally();
+        debugPrint(
+            "Network offline. Loading month-wise report from cache... Error: $networkError");
+        rawList = await _loadCachedReportLocally(scopeKey, currentUserId);
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
-      // Call utility method cleanly
       final grouped = CollectionUtils.groupCollectionsByMonth(rawList);
 
       if (mounted) {
@@ -142,7 +203,7 @@ class _MonthWiseReportScreenState extends State<MonthWiseReportScreen> {
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
                 subtitle: Text(
-                  'Total: ৳${data['total_collection'] ?? 0}',
+                  'Total: ${data['total_collection'] ?? 0}',
                   style: const TextStyle(color: Colors.green),
                 ),
               ),

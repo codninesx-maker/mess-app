@@ -8,7 +8,9 @@ import 'package:url_launcher/url_launcher.dart';
 import 'edit_member_screen.dart';
 
 class OccupiedRoomsTab extends StatefulWidget {
-  const OccupiedRoomsTab({super.key});
+  final String? messId;
+  final String? messName;
+  const OccupiedRoomsTab({super.key, this.messId, this.messName});
 
   @override
   State<OccupiedRoomsTab> createState() => _OccupiedRoomsTabState();
@@ -21,10 +23,14 @@ class _OccupiedRoomsTabState extends State<OccupiedRoomsTab> {
   List<String> _occupiedRoomNumbers = [];
   Map<String, List> _roomOccupantsMap = {};
   int _totalRoomsCount = 0;
+  String? _resolvedMessId;
 
   // Local Cache Keys
-  static const String _cacheSetupKey = 'offline_cache_occupied_rooms_setup';
-  static const String _cacheMembersKey = 'offline_cache_occupied_rooms_members';
+  static const String _cacheSetupPrefix = 'offline_cache_occupied_rooms_setup';
+  static const String _cacheMembersPrefix = 'offline_cache_occupied_rooms_members';
+
+  String _setupCacheKey(String scopeKey) => '${_cacheSetupPrefix}_$scopeKey';
+  String _membersCacheKey(String scopeKey) => '${_cacheMembersPrefix}_$scopeKey';
 
   @override
   void initState() {
@@ -32,22 +38,36 @@ class _OccupiedRoomsTabState extends State<OccupiedRoomsTab> {
     _fetchOccupiedRooms();
   }
 
-  Future<void> _cacheDataLocally(Map<String, dynamic>? setup, List members) async {
-    final prefs = await SharedPreferences.getInstance();
-    if (setup != null) {
-      await prefs.setString(_cacheSetupKey, jsonEncode(setup));
+  @override
+  void didUpdateWidget(covariant OccupiedRoomsTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.messId != widget.messId || oldWidget.messName != widget.messName) {
+      _fetchOccupiedRooms();
     }
-    await prefs.setString(_cacheMembersKey, jsonEncode(members));
   }
 
-  Future _loadCachedDataLocally() async {
+  Future<void> _cacheDataLocally(
+      String scopeKey,
+      Map<String, dynamic>? setup,
+      List members,
+      ) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (setup != null) {
+      await prefs.setString(_setupCacheKey(scopeKey), jsonEncode(setup));
+    }
+    await prefs.setString(_membersCacheKey(scopeKey), jsonEncode(members));
+  }
+
+  Future _loadCachedDataLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final setupStr = prefs.getString(_cacheSetupKey);
-      final membersStr = prefs.getString(_cacheMembersKey);
+      final setupStr = prefs.getString(_setupCacheKey(scopeKey));
+      final membersStr = prefs.getString(_membersCacheKey(scopeKey));
       return {
-        'setup': setupStr != null ? jsonDecode(setupStr) as Map<String, dynamic> : null,
-        'members': membersStr != null ? jsonDecode(membersStr) as List : [],
+        'setup': setupStr != null
+            ? Map<String, dynamic>.from(jsonDecode(setupStr) as Map)
+            : null,
+        'members': membersStr != null ? (jsonDecode(membersStr) as List) : [],
       };
     } catch (e) {
       debugPrint("Error reading local occupied rooms cache: $e");
@@ -56,48 +76,71 @@ class _OccupiedRoomsTabState extends State<OccupiedRoomsTab> {
   }
 
   Future<void> _fetchOccupiedRooms() async {
-    setState(() => _isLoading = true);
+    if (mounted) setState(() => _isLoading = true);
     try {
-      final user = _supabase.auth.currentUser;
-      final currentUserId = user?.id;
+      final currentUserId = _supabase.auth.currentUser?.id;
 
       if (currentUserId == null) {
         if (mounted) setState(() => _isLoading = false);
         return;
       }
 
+      String? targetMessId = widget.messId?.trim();
+      if (targetMessId != null && targetMessId.isEmpty) {
+        targetMessId = null;
+      }
+
+      String cacheScopeKey = targetMessId ?? 'owner_$currentUserId';
       Map<String, dynamic>? setupResponse;
       List membersResponse = [];
 
       try {
-        // 1. Fetch setup config online
-        setupResponse = await _supabase
-            .from('mess_setup')
-            .select('total_rooms')
-            .eq('owner_id', currentUserId)
+        // 1. Fetch setup config online scoped to mess_id when available
+        var setupQuery =
+        _supabase.from('mess_setup').select('id, total_rooms');
+        if (targetMessId != null) {
+          setupQuery = setupQuery.eq('id', targetMessId);
+        } else {
+          setupQuery = setupQuery.eq('owner_id', currentUserId);
+        }
+
+        setupResponse = await setupQuery
+            .order('created_at', ascending: false)
             .limit(1)
             .maybeSingle();
 
-        // 2. Fetch members online
-        membersResponse = await _supabase
-            .from('mess_members')
-            .select('*')
-            .eq('owner_id', currentUserId)
-            .order('name', ascending: true);
+        if (targetMessId == null) {
+          targetMessId = setupResponse?['id']?.toString();
+          if (targetMessId != null && targetMessId.isNotEmpty) {
+            cacheScopeKey = targetMessId;
+          }
+        }
 
-        // Cache locally for offline use
-        await _cacheDataLocally(setupResponse, membersResponse);
+        _resolvedMessId = targetMessId;
+
+        // 2. Fetch members online scoped strictly to mess_id when available
+        var membersQuery = _supabase.from('mess_members').select('*');
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          membersQuery = membersQuery.eq('mess_id', targetMessId);
+        } else {
+          membersQuery = membersQuery.eq('owner_id', currentUserId);
+        }
+        membersResponse = await membersQuery.order('name', ascending: true);
+
+        await _cacheDataLocally(cacheScopeKey, setupResponse, membersResponse);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        // Fallback to local cache quietly if offline
-        debugPrint("🌐 Network offline. Loading occupied rooms from local cache... Error: $networkError");
-        final cached = await _loadCachedDataLocally();
+        debugPrint(
+          "🌐 Network offline. Loading occupied rooms from local cache... Error: $networkError",
+        );
+        final cached = await _loadCachedDataLocally(cacheScopeKey);
         setupResponse = cached['setup'] as Map<String, dynamic>?;
-        membersResponse = cached['members'] as List;
+        membersResponse = (cached['members'] as List?) ?? [];
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
-      final totalRooms = (setupResponse?['total_rooms'] as num?)?.toInt() ?? 54;
+      final totalRooms =
+          (setupResponse?['total_rooms'] as num?)?.toInt() ?? 55;
 
       Map<String, List> occupantsMap = {};
       for (var member in membersResponse) {
@@ -158,7 +201,9 @@ class _OccupiedRoomsTabState extends State<OccupiedRoomsTab> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Exit Member'),
-        content: Text('Are you sure you want to mark ${member['name']} as exited? This will move them to archives.'),
+        content: Text(
+          'Are you sure you want to mark ${member['name']} as exited? This will move them to archives.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -174,12 +219,51 @@ class _OccupiedRoomsTabState extends State<OccupiedRoomsTab> {
 
     if (confirm == true) {
       try {
+        final effectiveMessId =
+        (member['mess_id'] ?? _resolvedMessId ?? widget.messId)
+            ?.toString()
+            .trim();
+        final roomNumber = member['occupied_rooms']?.toString().trim();
+
         final archiveData = Map<String, dynamic>.from(member);
         archiveData.remove('id');
+        archiveData.remove('mess_member_payments');
+        if (effectiveMessId != null && effectiveMessId.isNotEmpty) {
+          archiveData['mess_id'] = effectiveMessId;
+        }
         archiveData['exited_at'] = DateTime.now().toIso8601String();
 
         await _supabase.from('mess_archive').insert(archiveData);
-        await _supabase.from('mess_members').delete().eq('id', member['id']);
+
+        var deleteQuery =
+        _supabase.from('mess_members').delete().eq('id', member['id']);
+        if (effectiveMessId != null && effectiveMessId.isNotEmpty) {
+          deleteQuery = deleteQuery.eq('mess_id', effectiveMessId);
+        }
+        await deleteQuery;
+
+        if (effectiveMessId != null &&
+            effectiveMessId.isNotEmpty &&
+            roomNumber != null &&
+            roomNumber.isNotEmpty) {
+          final remainingInRoom = await _supabase
+              .from('mess_members')
+              .select('id')
+              .eq('mess_id', effectiveMessId)
+              .eq('occupied_rooms', roomNumber)
+              .limit(1);
+
+          if ((remainingInRoom as List).isEmpty) {
+            await _supabase
+                .from('mess_rooms')
+                .update({
+              'is_occupied': false,
+              'empty_rooms': roomNumber,
+            })
+                .eq('mess_id', effectiveMessId)
+                .eq('occupied_rooms', roomNumber);
+          }
+        }
 
         _fetchOccupiedRooms();
 

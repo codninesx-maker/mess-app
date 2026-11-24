@@ -9,7 +9,14 @@ import 'add_new_members.dart';
 import 'edit_member_screen.dart';
 
 class ShowMembersDetailsScreen extends StatefulWidget {
-  const ShowMembersDetailsScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const ShowMembersDetailsScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<ShowMembersDetailsScreen> createState() =>
@@ -25,14 +32,24 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
   List _allMembers = [];
   List _filteredMembers = [];
   double _currentMonthElectricityShare = 0;
+  String? _resolvedMessId;
 
   // Local Cache Keys
   static const String _cacheMembersKey = 'offline_cache_show_members_list';
   static const String _cachePaymentsKey = 'offline_cache_show_members_payments';
 
+  String _scopeKeyFor(String? messId, String userId) {
+    return (messId != null && messId.isNotEmpty) ? messId : userId;
+  }
+
+  String _membersCacheKey(String scopeKey) => '${_cacheMembersKey}_$scopeKey';
+  String _paymentsCacheKey(String scopeKey) => '${_cachePaymentsKey}_$scopeKey';
+
   @override
   void initState() {
     super.initState();
+    _resolvedMessId =
+    (widget.messId != null && widget.messId!.isNotEmpty) ? widget.messId : null;
     _fetchMembersAndElectricity();
   }
 
@@ -42,17 +59,21 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
     super.dispose();
   }
 
-  Future<void> _cacheDataLocally(List members, List payments) async {
+  Future<void> _cacheDataLocally(
+      String scopeKey,
+      List members,
+      List payments,
+      ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cacheMembersKey, jsonEncode(members));
-    await prefs.setString(_cachePaymentsKey, jsonEncode(payments));
+    await prefs.setString(_membersCacheKey(scopeKey), jsonEncode(members));
+    await prefs.setString(_paymentsCacheKey(scopeKey), jsonEncode(payments));
   }
 
-  Future _loadCachedDataLocally() async {
+  Future _loadCachedDataLocally(String scopeKey) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      final membersStr = prefs.getString(_cacheMembersKey);
-      final paymentsStr = prefs.getString(_cachePaymentsKey);
+      final membersStr = prefs.getString(_membersCacheKey(scopeKey));
+      final paymentsStr = prefs.getString(_paymentsCacheKey(scopeKey));
       return {
         'members': membersStr != null ? jsonDecode(membersStr) as List : [],
         'payments': paymentsStr != null ? jsonDecode(paymentsStr) as List : [],
@@ -63,7 +84,209 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
     }
   }
 
-  // Fetch members, payments, and current month electricity shares dynamically
+  bool _isSameMonthAndYear(dynamic rawMonthOrDate, DateTime targetDate) {
+    if (rawMonthOrDate == null) return false;
+    final text = rawMonthOrDate.toString().toLowerCase().trim();
+    if (text.isEmpty) return false;
+
+    final fullMonth = _getMonthName(targetDate.month).toLowerCase(); // e.g. november
+    final shortMonth = fullMonth.substring(0, 3); // e.g. nov
+    final yearStr = targetDate.year.toString(); // e.g. 2026
+    final monthNumPadded = targetDate.month.toString().padLeft(2, '0'); // e.g. 11
+
+    // Matches "November 2026", "Nov 2026", "2026-11", "2026-11-15", "11/2026"
+    if (text.contains(yearStr) &&
+        (text.contains(fullMonth) ||
+            text.contains(shortMonth) ||
+            text.contains('-$monthNumPadded') ||
+            text.contains('$monthNumPadded/'))) {
+      return true;
+    }
+
+    // Fallback if only month name is stored without year (e.g. "November")
+    if (text == fullMonth || text == shortMonth) {
+      return true;
+    }
+
+    return false;
+  }
+  bool _isFullyPaidForCurrentMonth(Map<String, dynamic> member, List payments) {
+    final now = DateTime.now();
+    final bool hasStarted = _hasMemberStartedForMonth(member, now);
+    final double profileDue = (member['due'] as num?)?.toDouble() ?? 0.0;
+    final double calcDue =
+        ((member['calculated_due'] ?? profileDue) as num?)?.toDouble() ?? 0.0;
+
+    if (calcDue > 0) return false;
+    if (!hasStarted) return true;
+
+    final double expectedRent = (member['room_rent'] as num?)?.toDouble() ?? 0;
+
+    double currentMonthRentPaid = 0;
+    double currentMonthElecPaid = 0;
+
+    for (var p in payments) {
+      if (_isPaymentInCurrentMonth(p, now)) {
+        currentMonthRentPaid += (p['rent_amount'] as num?)?.toDouble() ?? 0;
+        currentMonthElecPaid +=
+            (p['electricity_bill'] as num?)?.toDouble() ?? 0;
+      }
+    }
+
+    final bool isRentPaid = expectedRent > 0
+        ? currentMonthRentPaid >= expectedRent
+        : currentMonthRentPaid > 0;
+    final bool isElecPaid = _currentMonthElectricityShare <= 0 ||
+        currentMonthElecPaid >= _currentMonthElectricityShare;
+
+    return isRentPaid && isElecPaid;
+  }
+
+  bool _hasMemberStartedForMonth(Map<String, dynamic> member, DateTime referenceDate) {
+    final rawEntryDate = member['entry_date']?.toString().trim();
+    if (rawEntryDate != null && rawEntryDate.isNotEmpty) {
+      final parsedDate = DateTime.tryParse(rawEntryDate);
+      if (parsedDate != null) {
+        // Compare by year & month (end of current month) so entry on 2026-11-23 counts for Nov 2026,
+        // while entry on 2026-12-01 does NOT count for Nov 2026.
+        final currentYearMonth = referenceDate.year * 12 + referenceDate.month;
+        final entryYearMonth = parsedDate.year * 12 + parsedDate.month;
+        if (entryYearMonth > currentYearMonth) {
+          return false;
+        }
+      }
+    }
+    // Fallback check on the `month` text column if entry_date is missing
+    final monthText = (member['month'] ?? '').toString().toLowerCase().trim();
+    if (monthText.isNotEmpty && (rawEntryDate == null || rawEntryDate.isEmpty)) {
+      const monthOrder = {
+        'january': 1, 'jan': 1,
+        'february': 2, 'feb': 2,
+        'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4,
+        'may': 5,
+        'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7,
+        'august': 8, 'aug': 8,
+        'september': 9, 'sep': 9, 'sept': 9,
+        'october': 10, 'oct': 10,
+        'november': 11, 'nov': 11,
+        'december': 12, 'dec': 12,
+      };
+      final entryMonthNum = monthOrder[monthText];
+      if (entryMonthNum != null) {
+        // If entryMonthNum is ahead of referenceDate.month in the same calendar year
+        if (entryMonthNum > referenceDate.month &&
+            !(referenceDate.month == 11 && entryMonthNum == 12 &&
+                (rawEntryDate ?? '').contains('2025'))) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+  Map<String, double> _extractPaymentAmounts(Map<String, dynamic> p) {
+    final typeText =
+    (p['payment_type'] ?? p['type'] ?? p['category'] ?? p['purpose'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+
+    double rentVal =
+    ((p['rent_amount'] ?? p['rent_paid'] ?? 0) as num).toDouble();
+    double elecVal = ((p['electricity_bill'] ??
+        p['electricity_paid'] ??
+        p['electricity_amount'] ??
+        0) as num)
+        .toDouble();
+
+    final double genericAmt =
+    ((p['amount'] ?? p['paid_amount'] ?? p['paid'] ?? 0) as num).toDouble();
+
+    // If neither specific rent nor electricity column was populated, use generic amount
+    if (rentVal == 0 && elecVal == 0 && genericAmt > 0) {
+      if (typeText.contains('elec')) {
+        elecVal = genericAmt;
+      } else {
+        rentVal = genericAmt;
+      }
+    }
+
+    return {
+      'rent': rentVal,
+      'elec': elecVal,
+      'total': rentVal + elecVal,
+    };
+  }
+
+  Map<String, double> _calculateMemberDueBreakdown(
+      Map<String, dynamic> member,
+      double defaultMonthlyElectricityShare,
+      ) {
+    final now = DateTime.now();
+    final bool hasStartedCurrentMonth = _hasMemberStartedForMonth(member, now);
+
+    // Current month rent & electricity share (0 if member hasn't started yet)
+    final double monthlyRent = hasStartedCurrentMonth
+        ? ((member['room_rent'] ??
+        member['monthly_rent'] ??
+        member['rent'] ??
+        0) as num)
+        .toDouble()
+        : 0.0;
+
+    final double memberElec =
+    ((member['electricity_share'] ?? member['electricity_bill'] ?? 0) as num)
+        .toDouble();
+    final double monthlyElectricity = hasStartedCurrentMonth
+        ? (memberElec > 0 ? memberElec : defaultMonthlyElectricityShare)
+        : 0.0;
+
+    // Previous / carried-over due
+    final double previousDue =
+    ((member['previous_due'] ?? 0) as num).toDouble();
+
+    double currentMonthRentPaid = 0.0;
+    double currentMonthElectricityPaid = 0.0;
+
+    final List payments = (member['mess_member_payments'] as List?) ?? [];
+    for (final rawPayment in payments) {
+      if (rawPayment is! Map) continue;
+      final p = Map<String, dynamic>.from(rawPayment);
+
+      final dynamic monthField = p['month_year'] ??
+          p['month'] ??
+          p['payment_month'] ??
+          p['paid_month'] ??
+          p['payment_date'] ??
+          p['created_at'];
+
+      if (!_isSameMonthAndYear(monthField, now)) continue;
+
+      final amounts = _extractPaymentAmounts(p);
+      currentMonthRentPaid += amounts['rent'] ?? 0.0;
+      currentMonthElectricityPaid += amounts['elec'] ?? 0.0;
+    }
+
+    final double unpaidCurrentRent =
+    (monthlyRent - currentMonthRentPaid).clamp(0.0, double.infinity);
+    final double unpaidCurrentElectricity =
+    (monthlyElectricity - currentMonthElectricityPaid)
+        .clamp(0.0, double.infinity);
+
+    final double totalDue =
+        previousDue + unpaidCurrentRent + unpaidCurrentElectricity;
+
+    return {
+      'previous_due': double.parse(previousDue.toStringAsFixed(2)),
+      'unpaid_rent': double.parse(unpaidCurrentRent.toStringAsFixed(2)),
+      'unpaid_electricity':
+      double.parse(unpaidCurrentElectricity.toStringAsFixed(2)),
+      'total_due': double.parse(totalDue.toStringAsFixed(2)),
+    };
+  }
+
   // Fetch members, payments, and dynamically calculate current month electricity share
   Future<void> _fetchMembersAndElectricity() async {
     setState(() => _isLoading = true);
@@ -77,61 +300,100 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
         return;
       }
 
+      String? targetMessId = _resolvedMessId;
+      String scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+
       List membersList = [];
       List paymentsList = [];
       double monthlyElecShare = 0;
 
       try {
-        // Fetch members, electricity bills, and setup concurrently
-        final results = await Future.wait([
-          _supabase
-              .from('mess_members')
-              .select('*')
-              .eq('owner_id', currentUserId)
-              .order('name', ascending: false),
-          _supabase
-              .from('mess_electricity_bills')
-              .select('*')
-              .eq('owner_id', currentUserId),
-          _supabase
+        if (targetMessId == null || targetMessId.isEmpty) {
+          final setupRow = await _supabase
               .from('mess_setup')
-              .select('monthly_electricity_bill')
-              .eq('owner_id', currentUserId),
+              .select('id')
+              .eq('owner_id', currentUserId)
+              .order('created_at', ascending: false)
+              .limit(1)
+              .maybeSingle();
+          targetMessId = setupRow?['id']?.toString();
+          if (targetMessId != null && targetMessId.isNotEmpty) {
+            _resolvedMessId = targetMessId;
+            scopeKey = _scopeKeyFor(targetMessId, currentUserId);
+          }
+        }
+
+        var membersQuery = _supabase.from('mess_members').select('*');
+        var billsQuery = _supabase.from('mess_electricity_bills').select('*');
+        var setupQuery = _supabase
+            .from('mess_setup')
+            .select('monthly_electricity_bill, rent_per_room');
+
+        if (targetMessId != null && targetMessId.isNotEmpty) {
+          membersQuery = membersQuery.eq('mess_id', targetMessId);
+          billsQuery = billsQuery.eq('mess_id', targetMessId);
+          setupQuery = setupQuery.eq('id', targetMessId);
+        } else {
+          membersQuery = membersQuery.eq('owner_id', currentUserId);
+          billsQuery = billsQuery.eq('owner_id', currentUserId);
+          setupQuery = setupQuery.eq('owner_id', currentUserId);
+        }
+
+        final results = await Future.wait([
+          membersQuery.order('name', ascending: false),
+          billsQuery,
+          setupQuery,
         ]);
 
         final membersResponse = results[0] as List;
         final billsResponse = results[1] as List;
         final setupResponse = results[2] as List;
 
-        membersList = List.from(membersResponse);
+        membersList = membersResponse
+            .map((e) => Map<String, dynamic>.from(e as Map))
+            .toList();
 
         if (currentUserEmail != null && currentUserEmail.isNotEmpty) {
           membersList = membersList.where((m) {
-            final memberEmail = (m['email'] ?? '').toString().toLowerCase().trim();
+            final memberEmail =
+            (m['email'] ?? '').toString().toLowerCase().trim();
             return memberEmail.isEmpty || memberEmail != currentUserEmail;
           }).toList();
         }
 
-        // --- DYNAMICALLY CALCULATE TRUE PER-MEMBER ELECTRICITY SHARE FOR CURRENT MONTH ---
-        final now = DateTime.now();
-        final currentMonthName = _getMonthName(now.month).toLowerCase();
-        final currentYearStr = now.year.toString();
+        // Fill room rent in member row store rent individually
+        for (final m in membersList) {
+          final memberRent =
+          ((m['room_rent'] ?? m['monthly_rent'] ?? m['rent'] ?? 0) as num)
+              .toDouble();
+          m['room_rent'] = memberRent;
+        }
 
+        // Dynamically calculate current month per-member electricity share
+        final double setupElecRate = setupResponse.isNotEmpty
+            ? ((setupResponse.first['monthly_electricity_bill'] ?? 0) as num).toDouble()
+            : 0.0;
+
+        final now = DateTime.now();
         double currentMonthTotalBills = 0.0;
         for (var b in billsResponse) {
-          final monthYear = (b['month_year'] ?? '').toString().toLowerCase().trim();
-          final amount = (b['amount'] as num?)?.toDouble() ?? 0.0;
-          if (monthYear.contains(currentMonthName) && monthYear.contains(currentYearStr)) {
+          final amount = ((b['amount'] ?? 0) as num).toDouble();
+          if (_isSameMonthAndYear(b['month_year'] ?? b['bill_month'] ?? b['bill_date'], now)) {
             currentMonthTotalBills += amount;
           }
         }
 
-        int activeMemberCount = membersList.length;
-        if (activeMemberCount > 0 && currentMonthTotalBills > 0) {
-          monthlyElecShare = double.parse((currentMonthTotalBills / activeMemberCount).toStringAsFixed(2));
-        } else if (setupResponse.isNotEmpty) {
-          // Fallback to setup table value if no bills found for current month
-          monthlyElecShare = (setupResponse.first['monthly_electricity_bill'] as num?)?.toDouble() ?? 0;
+        final int eligibleElectricityMemberCount = membersList
+            .where((m) => _hasMemberStartedForMonth(m, now))
+            .length;
+
+        if (setupElecRate > 0) {
+          monthlyElecShare = setupElecRate;
+        } else if (eligibleElectricityMemberCount > 0 && currentMonthTotalBills > 0) {
+          monthlyElecShare = double.parse(
+              (currentMonthTotalBills / eligibleElectricityMemberCount).toStringAsFixed(2));
+        } else {
+          monthlyElecShare = 0.0;
         }
 
         if (membersList.isNotEmpty) {
@@ -142,20 +404,28 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
               .select('*')
               .filter('member_id', 'in', memberIds);
 
-          paymentsList = List.from(paymentsResponse);
+          paymentsList = paymentsResponse
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
         }
 
-        await _cacheDataLocally(membersList, paymentsList);
+        await _cacheDataLocally(scopeKey, membersList, paymentsList);
         if (mounted) setState(() => _isOfflineMode = false);
       } catch (networkError) {
-        debugPrint("🌐 Network offline. Loading members from local cache... Error: $networkError");
-        final cached = await _loadCachedDataLocally();
-        membersList = cached['members']!;
-        paymentsList = cached['payments']!;
+        debugPrint(
+            "🌐 Network offline. Loading members from local cache... Error: $networkError");
+        final cached = await _loadCachedDataLocally(scopeKey);
+        membersList = (cached['members'] ?? [])
+            .map((e) => Map<String, dynamic>.from(e as Map))
+            .toList();
+        paymentsList = (cached['payments'] ?? [])
+            .map((e) => Map<String, dynamic>.from(e as Map))
+            .toList();
 
         if (currentUserEmail != null && currentUserEmail.isNotEmpty) {
           membersList = membersList.where((m) {
-            final memberEmail = (m['email'] ?? '').toString().toLowerCase().trim();
+            final memberEmail =
+            (m['email'] ?? '').toString().toLowerCase().trim();
             return memberEmail.isEmpty || memberEmail != currentUserEmail;
           }).toList();
         }
@@ -163,10 +433,20 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
         if (mounted) setState(() => _isOfflineMode = true);
       }
 
-      for (var member in membersList) {
-        member['mess_member_payments'] = paymentsList
+      // Mutate each map inside membersList directly so UI receives calculated values
+      for (int i = 0; i < membersList.length; i++) {
+        final member = membersList[i];
+        final memberPayments = paymentsList
             .where((p) => p['member_id'] == member['id'])
             .toList();
+        member['mess_member_payments'] = memberPayments;
+
+        final breakdown =
+        _calculateMemberDueBreakdown(member, monthlyElecShare);
+        member['previous_due_calc'] = breakdown['previous_due'];
+        member['unpaid_rent_calc'] = breakdown['unpaid_rent'];
+        member['unpaid_electricity_calc'] = breakdown['unpaid_electricity'];
+        member['calculated_due'] = breakdown['total_due'];
       }
 
       if (mounted) {
@@ -231,11 +511,11 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
       context: context,
       builder: (context) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
+        title: const Row(
           children: [
-            const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 28),
-            const SizedBox(width: 8),
-            const Text('Exit & Archive'),
+            Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 28),
+            SizedBox(width: 8),
+            Text('Exit & Archive'),
           ],
         ),
         content: Text(
@@ -262,12 +542,56 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
     if (confirm != true) return;
 
     try {
-      final archiveData = Map<String, dynamic>.from(member);
-      archiveData.remove('mess_member_payments');
+      final effectiveMessId =
+      (member['mess_id'] ?? _resolvedMessId ?? widget.messId)
+          ?.toString()
+          .trim();
+      final roomNumber = member['occupied_rooms']?.toString().trim();
+
+      final archiveData = Map<String, dynamic>.from(member)
+        ..remove('mess_member_payments')
+        ..remove('previous_due_calc')
+        ..remove('unpaid_rent_calc')
+        ..remove('unpaid_electricity_calc')
+        ..remove('calculated_due');
+
+      if (effectiveMessId != null && effectiveMessId.isNotEmpty) {
+        archiveData['mess_id'] = effectiveMessId;
+      }
       archiveData['exited_at'] = DateTime.now().toIso8601String();
 
       await _supabase.from('mess_archive').upsert(archiveData);
-      await _supabase.from('mess_members').delete().eq('id', member['id']);
+
+      var deleteQuery =
+      _supabase.from('mess_members').delete().eq('id', member['id']);
+      if (effectiveMessId != null && effectiveMessId.isNotEmpty) {
+        deleteQuery = deleteQuery.eq('mess_id', effectiveMessId);
+      }
+      await deleteQuery;
+
+      // Free the room in mess_rooms if no other active member occupies it in this mess
+      if (effectiveMessId != null &&
+          effectiveMessId.isNotEmpty &&
+          roomNumber != null &&
+          roomNumber.isNotEmpty) {
+        final remainingInRoom = await _supabase
+            .from('mess_members')
+            .select('id')
+            .eq('mess_id', effectiveMessId)
+            .eq('occupied_rooms', roomNumber)
+            .limit(1);
+
+        if ((remainingInRoom as List).isEmpty) {
+          await _supabase
+              .from('mess_rooms')
+              .update({
+            'is_occupied': false,
+            'empty_rooms': roomNumber,
+          })
+              .eq('mess_id', effectiveMessId)
+              .eq('occupied_rooms', roomNumber);
+        }
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -314,7 +638,8 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
 
   void _showMemberDetailsDialog(Map<String, dynamic> member) {
     final double advancePaid = (member['advance_paid'] as num?)?.toDouble() ?? 0;
-    final double dueAmount = (member['due'] as num?)?.toDouble() ?? 0;
+    final double dueAmount =
+        ((member['calculated_due'] ?? member['due']) as num?)?.toDouble() ?? 0;
 
     showDialog(
       context: context,
@@ -349,7 +674,8 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
                       builder: (context) => MemberLedgerScreen(
                         memberId: member['id']?.toString() ?? '',
                         memberName: member['name']?.toString() ?? 'Member',
-                        initialAdvancePaid: (member['advance_paid'] as num?)?.toDouble() ?? 0.0,
+                        initialAdvancePaid:
+                        (member['advance_paid'] as num?)?.toDouble() ?? 0.0,
                       ),
                     ),
                   );
@@ -413,22 +739,28 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (member['occupation'] != null && member['occupation'].toString().isNotEmpty) ...[
+              if (member['occupation'] != null &&
+                  member['occupation'].toString().isNotEmpty) ...[
                 Chip(
                   visualDensity: VisualDensity.compact,
-                  label: Text(member['occupation'], style: const TextStyle(fontSize: 11)),
+                  label: Text(member['occupation'],
+                      style: const TextStyle(fontSize: 11)),
                   backgroundColor: Colors.blue.withOpacity(0.08),
                   side: BorderSide(color: Colors.blue.withOpacity(0.2)),
                 ),
                 const SizedBox(height: 12),
               ],
-              _buildDetailRow(Icons.layers, 'Floor', _getFloorOrdinal(member['floor'])),
+              _buildDetailRow(
+                  Icons.layers, 'Floor', _getFloorOrdinal(member['floor'])),
               const SizedBox(height: 6),
-              _buildDetailRow(Icons.meeting_room, 'Room', member['occupied_rooms']?.toString() ?? 'N/A'),
+              _buildDetailRow(Icons.meeting_room, 'Room',
+                  member['occupied_rooms']?.toString() ?? 'N/A'),
               const SizedBox(height: 6),
-              _buildDetailRow(Icons.family_restroom, "Parents Name", member['parents_name'] ?? 'N/A'),
+              _buildDetailRow(Icons.family_restroom, "Parents Name",
+                  member['parents_name'] ?? 'N/A'),
               const SizedBox(height: 6),
-              _buildDetailRow(Icons.location_city, 'Home Town', member['home_town'] ?? 'N/A'),
+              _buildDetailRow(Icons.location_city, 'Home Town',
+                  member['home_town'] ?? 'N/A'),
               const SizedBox(height: 6),
               _buildClickableDetailRow(
                 Icons.phone,
@@ -441,12 +773,15 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
                 Icons.phone_android,
                 "Parents Mobile",
                 member['parents_mobile_number'] ?? 'N/A',
-                onTap: () => _makePhoneCall(member['parents_mobile_number'] ?? ''),
+                onTap: () =>
+                    _makePhoneCall(member['parents_mobile_number'] ?? ''),
               ),
               const SizedBox(height: 6),
-              _buildDetailRow(Icons.calendar_today, 'Entry Date', member['entry_date'] ?? 'N/A'),
+              _buildDetailRow(Icons.calendar_today, 'Entry Date',
+                  member['entry_date'] ?? 'N/A'),
               const SizedBox(height: 6),
-              _buildDetailRow(Icons.date_range, 'Month', member['month'] ?? 'N/A'),
+              _buildDetailRow(
+                  Icons.date_range, 'Month', member['month'] ?? 'N/A'),
               const SizedBox(height: 12),
               Container(
                 padding: const EdgeInsets.all(10),
@@ -461,35 +796,54 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('Advance Paid', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                        const Text('Advance Paid',
+                            style: TextStyle(fontSize: 11, color: Colors.grey)),
                         const SizedBox(height: 2),
-                        Text('৳${advancePaid.round()}', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.green)),
+                        Text('৳${advancePaid.round()}',
+                            style: const TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.green)),
                       ],
                     ),
-                    Container(height: 25, width: 1, color: Colors.grey.withOpacity(0.3)),
+                    Container(
+                        height: 25,
+                        width: 1,
+                        color: Colors.grey.withOpacity(0.3)),
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('Due Amount', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                        const Text('Due Amount',
+                            style: TextStyle(fontSize: 11, color: Colors.grey)),
                         const SizedBox(height: 2),
-                        Text('৳${dueAmount.round()}', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.red)),
+                        Text('৳${dueAmount.round()}',
+                            style: const TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.red)),
                       ],
                     ),
                   ],
                 ),
               ),
-              if (member['remarks'] != null && member['remarks'].toString().trim().isNotEmpty) ...[
+              if (member['remarks'] != null &&
+                  member['remarks'].toString().trim().isNotEmpty) ...[
                 const SizedBox(height: 10),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Icon(Icons.note, size: 16, color: Colors.grey[600]),
                     const SizedBox(width: 8),
-                    Text('Remarks: ', style: TextStyle(color: Colors.grey[700], fontSize: 12, fontWeight: FontWeight.w500)),
+                    Text('Remarks: ',
+                        style: TextStyle(
+                            color: Colors.grey[700],
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500)),
                     Expanded(
                       child: Text(
                         member['remarks'],
-                        style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+                        style: const TextStyle(
+                            fontSize: 12, fontStyle: FontStyle.italic),
                       ),
                     ),
                   ],
@@ -597,67 +951,19 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
   }
 
   bool _isPaymentInCurrentMonth(Map<String, dynamic> p, DateTime now) {
-    final monthYear = (p['month_year'] ?? '').toString().toLowerCase();
-    if (monthYear.isNotEmpty) {
-      if (monthYear.contains(now.year.toString()) &&
-          (monthYear.contains(now.month.toString()) ||
-              monthYear.contains(_getMonthName(now.month).toLowerCase()) ||
-              monthYear.contains(_getShortMonthName(now.month).toLowerCase()))) {
-        return true;
-      }
-    }
-
-    final rawDate = p['payment_date'] ?? p['created_at'];
-    if (rawDate != null) {
-      final parsedDate = DateTime.tryParse(rawDate.toString());
-      if (parsedDate != null &&
-          parsedDate.year == now.year &&
-          parsedDate.month == now.month) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  // Returns true ONLY when both room rent and electricity bill share are paid for the current month
-  bool _isFullyPaidForCurrentMonth(Map<String, dynamic> member, List payments) {
-    final now = DateTime.now();
-    final double expectedRent = (member['room_rent'] as num?)?.toDouble() ?? 0;
-    final double memberDue = (member['due'] as num?)?.toDouble() ?? 0.0;
-
-    if (memberDue > 0) return false;
-
-    double currentMonthRentPaid = 0;
-    double currentMonthElecPaid = 0;
-
-    for (var p in payments) {
-      if (_isPaymentInCurrentMonth(p, now)) {
-        currentMonthRentPaid += (p['rent_amount'] as num?)?.toDouble() ?? 0;
-        currentMonthElecPaid += (p['electricity_bill'] as num?)?.toDouble() ?? 0;
-      }
-    }
-
-    final bool isRentPaid = expectedRent > 0
-        ? currentMonthRentPaid >= expectedRent
-        : currentMonthRentPaid > 0;
-    final bool isElecPaid = _currentMonthElectricityShare <= 0 || currentMonthElecPaid >= _currentMonthElectricityShare;
-
-    return isRentPaid && isElecPaid;
+    final dynamic monthField = p['month_year'] ??
+        p['month'] ??
+        p['payment_month'] ??
+        p['paid_month'] ??
+        p['payment_date'] ??
+        p['created_at'];
+    return _isSameMonthAndYear(monthField, now);
   }
 
   String _getMonthName(int month) {
     const months = [
       'January', 'February', 'March', 'April', 'May', 'June',
       'July', 'August', 'September', 'October', 'November', 'December'
-    ];
-    return months[month - 1];
-  }
-
-  String _getShortMonthName(int month) {
-    const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
     ];
     return months[month - 1];
   }
@@ -671,6 +977,7 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
     final List payments = member['mess_member_payments'] ?? [];
     final currentMonthKey = _getCurrentMonthYearKey();
     final now = DateTime.now();
+    final bool hasStartedCurrentMonth = _hasMemberStartedForMonth(member, now);
 
     double totalPaidFromLedger = 0.0;
     final Set<String> uniqueMonths = {};
@@ -678,13 +985,20 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
     double currentMonthRentPaid = 0.0;
     double currentMonthElecPaid = 0.0;
 
-    for (var p in payments) {
-      final rentPaid = (p['rent_amount'] as num?)?.toDouble() ?? 0.0;
-      final elecPaid = (p['electricity_bill'] as num?)?.toDouble() ?? 0.0;
-      totalPaidFromLedger += (rentPaid + elecPaid);
+    for (var rawP in payments) {
+      if (rawP is! Map) continue;
+      final p = Map<String, dynamic>.from(rawP);
+      final amounts = _extractPaymentAmounts(p);
 
-      final monthYear = p['month_year']?.toString().trim();
-      if (monthYear != null && monthYear.isNotEmpty) {
+      final double rentPaid = amounts['rent']!;
+      final double elecPaid = amounts['elec']!;
+      totalPaidFromLedger += amounts['total']!;
+
+      final monthYear =
+      (p['month_year'] ?? p['month'] ?? p['payment_month'] ?? '')
+          .toString()
+          .trim();
+      if (monthYear.isNotEmpty) {
         uniqueMonths.add(monthYear);
       }
 
@@ -694,27 +1008,38 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
       }
     }
 
-    final bool paidForCurrentMonth = _isFullyPaidForCurrentMonth(member, payments);
     final double profileDue = (member['due'] as num?)?.toDouble() ?? 0.0;
-    final double expectedRent = (member['room_rent'] as num?)?.toDouble() ?? 0.0;
+    final double expectedRent = hasStartedCurrentMonth
+        ? ((member['room_rent'] as num?)?.toDouble() ?? 0.0)
+        : 0.0;
+    final double expectedElec =
+    hasStartedCurrentMonth ? _currentMonthElectricityShare : 0.0;
 
-    // Expected monthly total charges (Room Rent + Dynamic Monthly Electricity Share)
-    final double totalExpectedThisMonth = expectedRent + _currentMonthElectricityShare;
+    final double totalExpectedThisMonth = expectedRent + expectedElec;
     final double totalPaidThisMonth = currentMonthRentPaid + currentMonthElecPaid;
 
-    double unpaidThisMonth = totalExpectedThisMonth > 0
-        ? (totalExpectedThisMonth - totalPaidThisMonth).clamp(0.0, double.infinity)
+    final double unpaidThisMonth = totalExpectedThisMonth > 0
+        ? (totalExpectedThisMonth - totalPaidThisMonth)
+        .clamp(0.0, double.infinity)
         : 0.0;
 
-    // Net Due = Profile Carried-over Due + Unpaid Current Month Balance
-    double netDue = profileDue + unpaidThisMonth;
+    // Previous/carried-over due + current month unpaid rent & electricity only
+    final double netDue =
+        ((member['calculated_due'] ?? (profileDue + unpaidThisMonth)) as num?)
+            ?.toDouble() ??
+            0.0;
+
+    final bool paidForCurrentMonth =
+        _isFullyPaidForCurrentMonth(member, payments) && netDue <= 0;
 
     String unpaidLabel;
     if (netDue > 0) {
       unpaidLabel = 'Due: ${netDue.round()}';
-    } else if (currentMonthRentPaid < expectedRent) {
+    } else if (hasStartedCurrentMonth && currentMonthRentPaid < expectedRent) {
       unpaidLabel = 'Room Rent Unpaid';
-    } else if (_currentMonthElectricityShare > 0 && currentMonthElecPaid < _currentMonthElectricityShare) {
+    } else if (hasStartedCurrentMonth &&
+        expectedElec > 0 &&
+        currentMonthElecPaid < expectedElec) {
       unpaidLabel = 'Elec Bill Unpaid';
     } else {
       unpaidLabel = 'Unpaid';
@@ -768,7 +1093,9 @@ class _ShowMembersDetailsScreenState extends State<ShowMembersDetailsScreen> {
                   const SizedBox(height: 2),
                   paidForCurrentMonth
                       ? Text(
-                    'Paid ($currentMonthKey)',
+                    hasStartedCurrentMonth
+                        ? 'Paid ($currentMonthKey)'
+                        : 'Starts ${member['month'] ?? 'Future'}',
                     style: const TextStyle(
                       fontSize: 10,
                       fontWeight: FontWeight.w600,

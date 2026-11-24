@@ -1,10 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:mess_sur/mess/electric_bill_details.dart';
 import 'package:mess_sur/mess/show_members_details.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
 import 'MonthCollectionScreen.dart';
 import 'add_new_members.dart';
 import 'archive.dart';
@@ -12,7 +12,7 @@ import 'edit_mess_setup.dart';
 import 'mess_setup.dart';
 import 'room_status.dart';
 
-class ManageMessCard extends StatelessWidget {
+class ManageMessCard extends StatefulWidget {
   final VoidCallback? onMemberAdded;
   final String? ownerId;
   final String? ownerEmail;
@@ -24,12 +24,306 @@ class ManageMessCard extends StatelessWidget {
     this.ownerEmail,
   });
 
-  // Helper to guarantee we always have the active owner's ID
-  String? get _effectiveOwnerId =>
-      ownerId ?? Supabase.instance.client.auth.currentUser?.id;
+  @override
+  State<ManageMessCard> createState() => _ManageMessCardState();
+}
 
-  // Local Cache Key for offline setup navigation check
-  static const String _cacheSetupKey = 'offline_cache_mess_setup_data';
+class _ManageMessCardState extends State<ManageMessCard> {
+  Timer? _setupTapTimer;
+  int _setupTapCount = 0;
+  Offset _lastTapGlobalPosition = Offset.zero;
+
+  String? get _effectiveOwnerId =>
+      widget.ownerId ?? Supabase.instance.client.auth.currentUser?.id;
+
+  String _setupCacheKey(String ownerId) => 'offline_cache_mess_setup_data_$ownerId';
+  String _allSetupsCacheKey(String ownerId) => 'offline_cache_all_mess_setups_$ownerId';
+
+  @override
+  void dispose() {
+    _setupTapTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<List> _loadAllSetupsData(
+      String currentOwnerId,
+      ) async {
+    List setups = [];
+    final allKey = _allSetupsCacheKey(currentOwnerId);
+    final singleKey = _setupCacheKey(currentOwnerId);
+
+    try {
+      final response = await Supabase.instance.client
+          .from('mess_setup')
+          .select('*')
+          .eq('owner_id', currentOwnerId)
+          .order('created_at', ascending: false);
+
+      setups = (response as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+
+      final prefs = await SharedPreferences.getInstance();
+      if (setups.isNotEmpty) {
+        await prefs.setString(allKey, jsonEncode(setups));
+        await prefs.setString(singleKey, jsonEncode(setups.first));
+      } else {
+        await prefs.remove(allKey);
+        await prefs.remove(singleKey);
+      }
+    } catch (networkError) {
+      debugPrint(
+        "🌐 Network offline in ManageMessCard. Loading setups from cache... Error: $networkError",
+      );
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final allCachedStr = prefs.getString(allKey);
+        if (allCachedStr != null) {
+          final decoded = jsonDecode(allCachedStr);
+          if (decoded is List) {
+            setups = decoded
+                .map((e) => Map<String, dynamic>.from(e as Map))
+                .toList();
+          }
+        } else {
+          final singleCachedStr = prefs.getString(singleKey);
+          if (singleCachedStr != null) {
+            final decoded = jsonDecode(singleCachedStr);
+            if (decoded is Map<String, dynamic>) {
+              setups = [decoded];
+            }
+          }
+        }
+      } catch (cacheError) {
+        debugPrint("Error reading local setups cache: $cacheError");
+      }
+    }
+
+    return setups;
+  }
+
+  Future? _selectMessIfNeeded(
+      String currentOwnerId, {
+        Offset? fallbackPosition,
+      }) async {
+    final setups = await _loadAllSetupsData(currentOwnerId);
+    if (!mounted) return null;
+
+    if (setups.length == 1) {
+      return setups.first;
+    }
+    if (setups.length > 1) {
+      return await _showMessSubMenuCard(
+        setups,
+        fallbackPosition ?? _lastTapGlobalPosition,
+      );
+    }
+    return null;
+  }
+
+  Future? _showMessSubMenuCard(
+      List setups,
+      Offset? fallbackPosition,
+      ) async {
+    final RenderBox? overlay =
+    Overlay.of(context).context.findRenderObject() as RenderBox?;
+    final RenderBox? cardBox = context.findRenderObject() as RenderBox?;
+
+    if (overlay == null) return null;
+    Rect targetRect;
+    if (cardBox != null && cardBox.hasSize) {
+      final Offset cardTopLeft = cardBox.localToGlobal(Offset.zero, ancestor: overlay);
+      final Size cardSize = cardBox.size;
+      // Anchor right near/above the "Manage Your Mess" card
+      targetRect = Rect.fromLTWH(
+        cardTopLeft.dx + 16,
+        cardTopLeft.dy,
+        cardSize.width - 32,
+        cardSize.height,
+      );
+    } else {
+      final Offset pos = fallbackPosition ?? Offset.zero;
+      targetRect = Rect.fromPoints(pos, pos);
+    }
+    final RelativeRect position = RelativeRect.fromRect(
+      targetRect,
+      Offset.zero & overlay.size,
+    );
+
+    // Value: 0..setups.length-1 = select mess index, -1 = create new mess
+    final int? choice = await showMenu<int>(
+      context: context,
+      position: position,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+      items: [
+        const PopupMenuItem<int>(
+          enabled: false,
+          height: 34,
+          child: Text(
+            'Select Mess',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              color: Colors.grey,
+            ),
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
+        ...List.generate(setups.length, (index) {
+          final mess = setups[index];
+          final name = (mess['mess_name'] ?? 'Unnamed Mess').toString();
+          final floors = mess['total_floors'] ?? 1;
+          final rooms = mess['total_rooms'] ?? 1;
+
+          return PopupMenuItem<int>(
+            value: index,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.apartment, size: 19, color: Colors.orange),
+                const SizedBox(width: 10),
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                      Text(
+                        '$floors Floors • $rooms Rooms',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
+            ),
+          );
+        }),
+        const PopupMenuDivider(height: 3),
+      ],
+    );
+    if (choice == null || !mounted) return null;
+    if (choice == -1) {
+      await _navigateToSetup(forceNewSetup: true);
+      return null;
+    }
+    if (choice >= 0 && choice < setups.length) {
+      return setups[choice];
+    }
+    return null;
+  }
+
+  Future<void> _navigateToSetup({required bool forceNewSetup}) async {
+    final currentOwnerId = _effectiveOwnerId;
+    if (currentOwnerId == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('User session not found. Please log in again.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    if (forceNewSetup) {
+      final result = await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => const MessSetupScreen(createNew: true),
+        ),
+      );
+      if (result == true && widget.onMemberAdded != null) {
+        widget.onMemberAdded!();
+      }
+      return;
+    }
+
+    final setups = await _loadAllSetupsData(currentOwnerId);
+    if (!mounted) return;
+
+    Map<String, dynamic>? selectedSetup;
+    if (setups.isEmpty) {
+      final result = await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => const MessSetupScreen(createNew: true),
+        ),
+      );
+      if (result == true && widget.onMemberAdded != null) {
+        widget.onMemberAdded!();
+      }
+      return;
+    } else if (setups.length == 1) {
+      selectedSetup = setups.first;
+    } else {
+      selectedSetup =
+      await _showMessSubMenuCard(setups, _lastTapGlobalPosition);
+      if (selectedSetup == null || !mounted) return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _setupCacheKey(currentOwnerId),
+      jsonEncode(selectedSetup),
+    );
+
+    if (!mounted) return;
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => EditMessSetupScreen(
+          initialSetup: selectedSetup!,
+        ),
+      ),
+    );
+
+    if (result == true && widget.onMemberAdded != null) {
+      widget.onMemberAdded!();
+    }
+  }
+
+  void _handleMessSetupMenuTap(BuildContext menuContext) {
+    _setupTapCount += 1;
+    _setupTapTimer?.cancel();
+
+    if (_setupTapCount >= 3) {
+      _setupTapCount = 0;
+      if (menuContext.mounted && Navigator.canPop(menuContext)) {
+        Navigator.pop(menuContext);
+      }
+      _navigateToSetup(forceNewSetup: true);
+      return;
+    }
+
+    _setupTapTimer = Timer(const Duration(milliseconds: 320), () {
+      final count = _setupTapCount;
+      _setupTapCount = 0;
+      if (!mounted) return;
+
+      if (count == 1) {
+        if (menuContext.mounted && Navigator.canPop(menuContext)) {
+          Navigator.pop(menuContext);
+        }
+        _navigateToSetup(forceNewSetup: false);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -41,6 +335,8 @@ class ManageMessCard extends StatelessWidget {
       color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.4),
       child: GestureDetector(
         onTapDown: (TapDownDetails details) {
+          _lastTapGlobalPosition = details.globalPosition;
+
           final RenderBox overlay =
           Overlay.of(context).context.findRenderObject() as RenderBox;
           final RelativeRect position = RelativeRect.fromRect(
@@ -54,18 +350,39 @@ class ManageMessCard extends StatelessWidget {
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(12),
             ),
-            items: const [
+            items: [
               PopupMenuItem<int>(
-                value: 3,
-                child: Row(
-                  children: [
-                    Icon(Icons.settings_outlined, size: 20, color: Colors.orange),
-                    SizedBox(width: 12),
-                    Text('Mess Setup'),
-                  ],
+                padding: EdgeInsets.zero,
+                child: Builder(
+                  builder: (menuContext) => GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTapDown: (d) =>
+                    _lastTapGlobalPosition = d.globalPosition,
+                    onTap: () => _handleMessSetupMenuTap(menuContext),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.settings_outlined,
+                            size: 20,
+                            color: Colors.orange,
+                          ),
+                          SizedBox(width: 12),
+                          Text(
+                            'Mess Setup',
+                            style: TextStyle(color: Colors.black87),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 1,
                 child: Row(
                   children: [
@@ -75,47 +392,51 @@ class ManageMessCard extends StatelessWidget {
                   ],
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 2,
                 child: Row(
                   children: [
-                    Icon(Icons.person_add_outlined, size: 20, color: Colors.green),
+                    Icon(Icons.person_add_outlined,
+                        size: 20, color: Colors.green),
                     SizedBox(width: 12),
                     Text('Add new members'),
                   ],
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 4,
                 child: Row(
                   children: [
-                    Icon(Icons.archive_outlined, size: 20, color: Colors.purple),
+                    Icon(Icons.archive_outlined,
+                        size: 20, color: Colors.purple),
                     SizedBox(width: 12),
                     Text('Archived Members'),
                   ],
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 5,
                 child: Row(
                   children: [
-                    Icon(Icons.door_sliding_outlined, size: 20, color: Colors.teal),
+                    Icon(Icons.door_sliding_outlined,
+                        size: 20, color: Colors.teal),
                     SizedBox(width: 12),
                     Text('Room Status'),
                   ],
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 6,
                 child: Row(
                   children: [
-                    Icon(Icons.analytics_outlined, size: 20, color: Colors.indigo),
+                    Icon(Icons.analytics_outlined,
+                        size: 20, color: Colors.indigo),
                     SizedBox(width: 12),
                     Text('Month-Wise Collections'),
                   ],
                 ),
               ),
-              PopupMenuItem<int>(
+              const PopupMenuItem<int>(
                 value: 7,
                 child: Row(
                   children: [
@@ -127,108 +448,107 @@ class ManageMessCard extends StatelessWidget {
               ),
             ],
           ).then((int? selectedValue) async {
+            if (selectedValue == null) return;
             final currentOwnerId = _effectiveOwnerId;
-
             if (currentOwnerId == null) {
               if (context.mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('User session not found. Please log in again.')),
+                  const SnackBar(
+                    content: Text('User session not found. Please log in again.'),
+                  ),
                 );
               }
               return;
             }
 
-            if (selectedValue == 3) {
-              Map<String, dynamic>? setupData;
-
-              try {
-                // 1. Attempt online fetch strictly scoped to the logged-in owner's ID
-                setupData = await Supabase.instance.client
-                    .from('mess_setup')
-                    .select('*')
-                    .eq('owner_id', currentOwnerId)
-                    .maybeSingle();
-
-                // Save to local cache for offline usage
-                if (setupData != null) {
-                  final prefs = await SharedPreferences.getInstance();
-                  await prefs.setString(_cacheSetupKey, jsonEncode(setupData));
-                }
-              } catch (networkError) {
-                // 2. Silently fallback to local SharedPreferences cache when offline
-                debugPrint("🌐 Network offline in ManageMessCard. Loading setup from cache... Error: $networkError");
-                try {
-                  final prefs = await SharedPreferences.getInstance();
-                  final cachedStr = prefs.getString(_cacheSetupKey);
-                  if (cachedStr != null) {
-                    final decoded = jsonDecode(cachedStr);
-                    if (decoded is Map<String, dynamic>) {
-                      setupData = decoded;
-                    }
-                  }
-                } catch (cacheError) {
-                  debugPrint("Error reading local setup cache: $cacheError");
-                }
-              }
-
+            if (selectedValue == 1) {
+              final setups = await _loadAllSetupsData(currentOwnerId);
               if (!context.mounted) return;
 
-              final bool? result;
-              final localSetup = setupData; // Non-nullable promotion reference
-
-              if (localSetup == null) {
-                // No setup found anywhere -> Open MessSetupScreen
-                result = await Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const MessSetupScreen(),
-                  ),
-                );
-              } else {
-                // Setup exists -> Open EditMessSetupScreen with guaranteed non-null map
-                result = await Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => EditMessSetupScreen(
-                      initialSetup: localSetup,
-                    ),
-                  ),
-                );
+              Map<String, dynamic>? selectedMess;
+              if (setups.length == 1) {
+                selectedMess = setups.first;
+              } else if (setups.length > 1) {
+                selectedMess =
+                await _showMessSubMenuCard(setups, _lastTapGlobalPosition);
+                if (selectedMess == null || !context.mounted) return;
               }
 
-              if (result == true && onMemberAdded != null) {
-                onMemberAdded!();
-              }
-            } else if (selectedValue == 1) {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const ShowMembersDetailsScreen(),
+                  builder: (context) => ShowMembersDetailsScreen(
+                    messId: selectedMess?['id']?.toString(),
+                    messName: selectedMess?['mess_name']?.toString(),
+                  ),
                 ),
               );
             } else if (selectedValue == 2) {
+              final setups = await _loadAllSetupsData(currentOwnerId);
+              if (!context.mounted) return;
+
+              Map<String, dynamic>? selectedMess;
+              if (setups.length == 1) {
+                selectedMess = setups.first;
+              } else if (setups.length > 1) {
+                selectedMess = await _showMessSubMenuCard(
+                    setups, _lastTapGlobalPosition);
+                if (selectedMess == null || !context.mounted) return;
+              }
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const AddMembersScreen(),
+                  builder: (context) => AddMembersScreen(
+                    messId: selectedMess?['id']?.toString(),
+                  ),
                 ),
               ).then((result) {
-                if (result == true && onMemberAdded != null) {
-                  onMemberAdded!();
+                if (result == true && widget.onMemberAdded != null) {
+                  widget.onMemberAdded!();
                 }
               });
             } else if (selectedValue == 4) {
+              final setups = await _loadAllSetupsData(currentOwnerId);
+              if (!context.mounted) return;
+
+              Map<String, dynamic>? selectedMess;
+              if (setups.length == 1) {
+                selectedMess = setups.first;
+              } else if (setups.length > 1) {
+                selectedMess =
+                await _showMessSubMenuCard(setups, _lastTapGlobalPosition);
+                if (selectedMess == null || !context.mounted) return;
+              }
+
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const ArchiveScreen(),
+                  builder: (context) => ArchiveScreen(
+                    messId: selectedMess?['id']?.toString(),
+                    messName: selectedMess?['mess_name']?.toString(),
+                  ),
                 ),
               );
             } else if (selectedValue == 5) {
+              final setups = await _loadAllSetupsData(currentOwnerId);
+              if (!context.mounted) return;
+
+              Map<String, dynamic>? selectedMess;
+              if (setups.length == 1) {
+                selectedMess = setups.first;
+              } else if (setups.length > 1) {
+                selectedMess = await _showMessSubMenuCard(
+                    setups, _lastTapGlobalPosition);
+                if (selectedMess == null || !context.mounted) return;
+              }
+
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const RoomStatusScreen(),
+                  builder: (context) => RoomStatusScreen(
+                    messId: selectedMess?['id']?.toString(),
+                    messName: selectedMess?['mess_name']?.toString(),
+                  ),
                 ),
               );
             } else if (selectedValue == 6) {
@@ -239,27 +559,40 @@ class ManageMessCard extends StatelessWidget {
                 ),
               );
             } else if (selectedValue == 7) {
+              final setups = await _loadAllSetupsData(currentOwnerId);
+              if (!context.mounted) return;
+
+              Map<String, dynamic>? selectedMess;
+              if (setups.length == 1) {
+                selectedMess = setups.first;
+              } else if (setups.length > 1) {
+                selectedMess = await _showMessSubMenuCard(setups, _lastTapGlobalPosition);
+                if (selectedMess == null || !context.mounted) return;
+              }
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const ElectricBillDetailsScreen(),
+                  builder: (context) => ElectricBillDetailsScreen(
+                    messId: selectedMess?['id']?.toString(),
+                    messName: selectedMess?['mess_name']?.toString(),
+                  ),
                 ),
               ).then((_) {
-                if (onMemberAdded != null) {
-                  onMemberAdded!();
+                if (widget.onMemberAdded != null) {
+                  widget.onMemberAdded!();
                 }
               });
             }
           });
         },
-
         child: const ListTile(
           leading: Icon(Icons.people_alt),
           title: Text(
             'Manage Your Mess',
             style: TextStyle(fontWeight: FontWeight.bold),
           ),
-          subtitle: Text('View details, room status, add members, or check archive'),
+          subtitle: Text(
+              'View details, room status, add members, or check archive'),
           trailing: Icon(Icons.arrow_forward_ios, size: 16),
         ),
       ),

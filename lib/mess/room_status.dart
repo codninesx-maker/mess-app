@@ -3,7 +3,14 @@ import 'empty_rooms.dart';
 import 'occupied_rooms.dart';
 
 class RoomStatusScreen extends StatefulWidget {
-  const RoomStatusScreen({super.key});
+  final String? messId;
+  final String? messName;
+
+  const RoomStatusScreen({
+    super.key,
+    this.messId,
+    this.messName,
+  });
 
   @override
   State<RoomStatusScreen> createState() => _RoomStatusScreenState();
@@ -12,19 +19,34 @@ class RoomStatusScreen extends StatefulWidget {
 class _RoomStatusScreenState extends State<RoomStatusScreen> {
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final hasMess = widget.messId != null && widget.messId!.trim().isNotEmpty;
+    final subtitle = (widget.messName != null && widget.messName!.trim().isNotEmpty)
+        ? widget.messName!.trim()
+        : null;
+
     return DefaultTabController(
       length: 2,
       child: Scaffold(
         appBar: AppBar(
-          title: Row(
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
               Text(
                 'Room Status',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
-                  color: Theme.of(context).colorScheme.primary,
+                  color: colorScheme.primary,
                 ),
               ),
+              if (subtitle != null)
+                Text(
+                  subtitle,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
             ],
           ),
           bottom: const TabBar(
@@ -41,10 +63,17 @@ class _RoomStatusScreenState extends State<RoomStatusScreen> {
             ],
           ),
         ),
-        body: const TabBarView(
+        body: TabBarView(
+          key: ValueKey(hasMess ? widget.messId : 'all_messes'),
           children: [
-            EmptyRoomsTab(),
-            OccupiedRoomsTab(),
+            EmptyRoomsTab(
+              messId: widget.messId,
+              messName: widget.messName,
+            ),
+            OccupiedRoomsTab(
+              messId: widget.messId,
+              messName: widget.messName,
+            ),
           ],
         ),
       ),

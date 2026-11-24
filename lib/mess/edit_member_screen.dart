@@ -14,6 +14,7 @@ class EditMemberScreen extends StatefulWidget {
 
 class _EditMemberScreenState extends State<EditMemberScreen> {
   final _formKey = GlobalKey<FormState>();
+  String? get _activeMessId => widget.member['mess_id']?.toString();
 
   late final TextEditingController _nameController;
   late final TextEditingController _parentsNameController;
@@ -56,7 +57,22 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
     _floorController = TextEditingController(text: widget.member['floor']?.toString() ?? '');
     _roomNumberController = TextEditingController(text: widget.member['occupied_rooms']?.toString() ?? '');
     _entryDateController = TextEditingController(text: widget.member['entry_date'] ?? '');
-    _monthController = TextEditingController(text: widget.member['month'] ?? '');
+
+    final now = DateTime.now();
+    _monthOptions = _buildMonthOptions(now);
+
+    final existingMonth = widget.member['month']?.toString().trim() ?? '';
+    if (existingMonth.isNotEmpty && !_monthOptions.contains(existingMonth)) {
+      _monthOptions.insert(0, existingMonth);
+    }
+
+    final fallbackMonth = _monthOptions.contains('${_monthNames[now.month - 1]} ${now.year}')
+        ? '${_monthNames[now.month - 1]} ${now.year}'
+        : (_monthOptions.isNotEmpty ? _monthOptions.first : null);
+
+    _selectedMonth = existingMonth.isNotEmpty ? existingMonth : fallbackMonth;
+    _monthController = TextEditingController(text: _selectedMonth ?? '');
+
     _advancePaidController = TextEditingController(text: widget.member['advance_paid']?.toString() ?? '0');
     _dueController = TextEditingController(text: widget.member['due']?.toString() ?? '0');
     _remarksController = TextEditingController(text: widget.member['remarks'] ?? '');
@@ -106,12 +122,44 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
       });
     }
   }
+  static const List<String> _monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+
+  late final List<String> _monthOptions;
+  String? _selectedMonth;
+
+  List<String> _buildMonthOptions(DateTime anchorDate) {
+    final Set<String> uniqueMonths = {};
+    for (final y in [anchorDate.year, anchorDate.year + 1]) {
+      for (final m in _monthNames) {
+        uniqueMonths.add('$m $y');
+      }
+    }
+    return uniqueMonths.toList();
+  }
 
   /// Syncs updated member details into local SharedPreferences caches
-  Future<void> _updateCachedMemberLocally(dynamic memberId, Map<String, dynamic> updatedData) async {
+  Future<void> _updateCachedMemberLocally(
+      dynamic memberId,
+      Map<String, dynamic> updatedData, {
+        String? messId,
+        required String ownerId,
+      }) async {
     final prefs = await SharedPreferences.getInstance();
     try {
-      // 1. Update in active members cache
+      // 1. Update in general active members cache
       final membersStr = prefs.getString(_cacheMembersKey);
       if (membersStr != null) {
         final List membersList = jsonDecode(membersStr) as List;
@@ -124,7 +172,22 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
         await prefs.setString(_cacheMembersKey, jsonEncode(membersList));
       }
 
-      // 2. Update in archive members cache if present
+      // 2. Also update mess-scoped cache if present
+      final scope = (messId != null && messId.isNotEmpty) ? messId : ownerId;
+      final scopedKey = '${_cacheMembersKey}_$scope';
+      final scopedStr = prefs.getString(scopedKey);
+      if (scopedStr != null) {
+        final List scopedList = jsonDecode(scopedStr) as List;
+        for (int i = 0; i < scopedList.length; i++) {
+          if (scopedList[i]['id'] == memberId) {
+            scopedList[i] = {...scopedList[i], ...updatedData};
+            break;
+          }
+        }
+        await prefs.setString(scopedKey, jsonEncode(scopedList));
+      }
+
+      // 3. Update in archive members cache if present
       final archiveStr = prefs.getString(_cacheArchiveKey);
       if (archiveStr != null) {
         final List archiveList = jsonDecode(archiveStr) as List;
@@ -154,12 +217,36 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
         throw 'User not authenticated.';
       }
 
+      final oldRoomNumber =
+          widget.member['occupied_rooms']?.toString().trim() ?? '';
       final roomNumber = _roomNumberController.text.trim();
       final floorNumber = int.tryParse(_floorController.text.trim()) ?? 1;
-      final newAdvancePaid = double.tryParse(_advancePaidController.text.trim()) ?? 0;
+      final newAdvancePaid =
+          double.tryParse(_advancePaidController.text.trim()) ?? 0;
+      final newDue = double.tryParse(_dueController.text.trim()) ?? 0;
+      final newRoomRent = double.tryParse(_roomRentController.text.trim()) ?? 0;
+      final rawEntryDate = _entryDateController.text.trim();
       final memberId = widget.member['id'];
 
-      final updatedData = {
+      String? resolvedMessId =
+      (_activeMessId != null && _activeMessId!.isNotEmpty)
+          ? _activeMessId
+          : null;
+
+      if (resolvedMessId == null) {
+        final setupRow = await supabase
+            .from('mess_setup')
+            .select('id')
+            .eq('owner_id', currentUserId)
+            .order('created_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+        resolvedMessId = setupRow?['id']?.toString();
+      }
+
+      final updatedData = <String, dynamic>{
+        if (resolvedMessId != null && resolvedMessId.isNotEmpty)
+          'mess_id': resolvedMessId,
         'name': _nameController.text.trim(),
         'parents_name': _parentsNameController.text.trim(),
         'occupation': _occupationController.text.trim(),
@@ -168,67 +255,167 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
         'parents_mobile_number': _fatherMobileController.text.trim(),
         'floor': floorNumber,
         'occupied_rooms': roomNumber,
-        'entry_date': _entryDateController.text.trim(),
+        'entry_date': rawEntryDate.isEmpty ? null : rawEntryDate,
         'month': _monthController.text.trim(),
         'advance_paid': newAdvancePaid,
-        'due': double.tryParse(_dueController.text.trim()) ?? 0,
+        'due': newDue,
         'remarks': _remarksController.text.trim(),
-        'room_rent': double.tryParse(_roomRentController.text.trim()) ?? 0,
+        'room_rent': newRoomRent,
       };
 
+      final mergedCacheData = <String, dynamic>{
+        ...widget.member,
+        ...updatedData,
+        'entry_date': rawEntryDate,
+      };
+
+      bool savedRemotely = false;
       try {
-        // 1. Ensure updated room exists in mess_rooms (scoped to current owner)
+        // 1. Ensure updated room exists & is marked occupied in mess_rooms (scoped to mess_id)
         if (roomNumber.isNotEmpty) {
-          final existingRoom = await supabase
+          var roomLookup = supabase
               .from('mess_rooms')
               .select('id')
-              .eq('owner_id', currentUserId)
-              .eq('occupied_rooms', roomNumber)
-              .maybeSingle();
+              .eq('occupied_rooms', roomNumber);
+
+          if (resolvedMessId != null && resolvedMessId.isNotEmpty) {
+            roomLookup = roomLookup.eq('mess_id', resolvedMessId);
+          } else {
+            roomLookup = roomLookup.eq('owner_id', currentUserId);
+          }
+
+          final existingRoom = await roomLookup.maybeSingle();
 
           if (existingRoom == null) {
             await supabase.from('mess_rooms').insert({
-              'owner_id': currentUserId,
+              if (resolvedMessId != null && resolvedMessId.isNotEmpty)
+                'mess_id': resolvedMessId,
+              'owner_id': widget.member['owner_id'] ?? currentUserId,
               'occupied_rooms': roomNumber,
+              'empty_rooms': roomNumber,
               'floor': floorNumber,
-              'room_type': 'double',
+              'is_occupied': true,
             });
+          } else {
+            await supabase
+                .from('mess_rooms')
+                .update({'is_occupied': true, 'floor': floorNumber})
+                .eq('id', existingRoom['id']);
           }
         }
 
-        // 2. Update member details in active table 'mess_members'
-        await supabase
+        // 2. If room changed within this mess, check if old room has any remaining occupants
+        if (oldRoomNumber.isNotEmpty && oldRoomNumber != roomNumber) {
+          var remainingQuery = supabase
+              .from('mess_members')
+              .select('id')
+              .eq('occupied_rooms', oldRoomNumber)
+              .neq('id', memberId);
+
+          if (resolvedMessId != null && resolvedMessId.isNotEmpty) {
+            remainingQuery = remainingQuery.eq('mess_id', resolvedMessId);
+          } else {
+            remainingQuery = remainingQuery.eq('owner_id', currentUserId);
+          }
+
+          final remainingOccupants = await remainingQuery;
+          if ((remainingOccupants as List).isEmpty) {
+            var oldRoomUpdate = supabase
+                .from('mess_rooms')
+                .update({'is_occupied': false})
+                .eq('occupied_rooms', oldRoomNumber);
+
+            if (resolvedMessId != null && resolvedMessId.isNotEmpty) {
+              oldRoomUpdate = oldRoomUpdate.eq('mess_id', resolvedMessId);
+            } else {
+              oldRoomUpdate = oldRoomUpdate.eq('owner_id', currentUserId);
+            }
+            await oldRoomUpdate;
+          }
+        }
+
+        // 3. Update member details in active table 'mess_members'
+        var memberUpdateQuery = supabase
             .from('mess_members')
             .update(updatedData)
-            .eq('id', memberId)
-            .eq('owner_id', currentUserId);
+            .eq('id', memberId);
 
-        // 3. ALSO update 'mess_archive' just in case an archive record exists for this ID
-        await supabase
-            .from('mess_archive')
-            .update(updatedData)
-            .eq('id', memberId)
-            .eq('owner_id', currentUserId);
+        if (resolvedMessId != null && resolvedMessId.isNotEmpty) {
+          memberUpdateQuery = memberUpdateQuery.eq('mess_id', resolvedMessId);
+        }
 
+        final updatedMemberRows = await memberUpdateQuery.select('id');
+        if ((updatedMemberRows as List).isEmpty) {
+          throw StateError(
+            'No mess_members row was updated for id=$memberId (check RLS UPDATE policy).',
+          );
+        }
+
+        // 4. Best-effort sync to 'mess_archive' if an archive row exists
+        try {
+          var archiveQuery = supabase
+              .from('mess_archive')
+              .update({
+            if (resolvedMessId != null && resolvedMessId.isNotEmpty)
+              'mess_id': resolvedMessId,
+            'name': updatedData['name'],
+            'parents_name': updatedData['parents_name'],
+            'occupation': updatedData['occupation'],
+            'home_town': updatedData['home_town'],
+            'mobile_number': updatedData['mobile_number'],
+            'parents_mobile_number': updatedData['parents_mobile_number'],
+            'floor': updatedData['floor'],
+            'occupied_rooms': updatedData['occupied_rooms'],
+            'entry_date': updatedData['entry_date'],
+            'month': updatedData['month'],
+            'advance_paid': updatedData['advance_paid'],
+            'due': updatedData['due'],
+            'remarks': updatedData['remarks'],
+            'room_rent': updatedData['room_rent'],
+          })
+              .eq('id', memberId);
+
+          if (resolvedMessId != null && resolvedMessId.isNotEmpty) {
+            archiveQuery = archiveQuery.eq('mess_id', resolvedMessId);
+          }
+          await archiveQuery;
+        } catch (archiveErr) {
+          debugPrint("Skipped mess_archive sync: $archiveErr");
+        }
+
+        savedRemotely = true;
         if (mounted) setState(() => _isOfflineMode = false);
-      } catch (networkError) {
-        // Network offline -> Handle gracefully via local cache fallback
-        debugPrint("Network offline. Updating member in local cache... Error: $networkError");
-        if (mounted) setState(() => _isOfflineMode = true);
+      } catch (remoteError, stackTrace) {
+        debugPrint("❌ Remote member update failed: $remoteError");
+        debugPrint("$stackTrace");
+        if (mounted) {
+          setState(() => _isOfflineMode = true);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Cloud update failed: $remoteError'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
       }
 
-      // Always keep local cache synchronized
-      await _updateCachedMemberLocally(memberId, updatedData);
+      await _updateCachedMemberLocally(
+        memberId,
+        mergedCacheData,
+        messId: resolvedMessId,
+        ownerId: currentUserId,
+      );
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              _isOfflineMode
-                  ? 'Offline mode: Member changes saved locally!'
-                  : 'Member details updated successfully!',
+              savedRemotely
+                  ? 'Member details updated successfully!'
+                  : 'Saved locally (cloud update failed—check logs/RLS).',
             ),
-            backgroundColor: _isOfflineMode ? Colors.orange : Colors.green,
+            backgroundColor: savedRemotely ? Colors.green : Colors.orange,
           ),
         );
         Navigator.pop(context, true);
@@ -539,15 +726,26 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
                 validator: (value) => value == null || value.trim().isEmpty ? 'Please select entry date' : null,
               ),
               const SizedBox(height: 16),
-              TextFormField(
-                controller: _monthController,
-                readOnly: !_isEditingRoomAndDate,
+              DropdownButtonFormField<String>(
+                value: _selectedMonth,
+                isDense: true,
+                isExpanded: true,
+                itemHeight: 48,
+                menuMaxHeight: 240,
+                borderRadius: BorderRadius.circular(12),
+                dropdownColor: Colors.white,
                 style: TextStyle(
                   color: _isEditingRoomAndDate ? Colors.black87 : Colors.grey[700],
+                  fontSize: 13,
                 ),
                 decoration: InputDecoration(
-                  labelText: 'Month (e.g., November 2026)',
-                  labelStyle: TextStyle(color: Colors.grey[600]),
+                  labelText: 'Month',
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  labelStyle: TextStyle(color: Colors.grey[600], fontSize: 13),
                   border: const OutlineInputBorder(),
                   enabledBorder: OutlineInputBorder(
                     borderSide: BorderSide(
@@ -557,11 +755,36 @@ class _EditMemberScreenState extends State<EditMemberScreen> {
                   prefixIcon: Icon(
                     Icons.date_range,
                     color: _isEditingRoomAndDate ? Colors.blue : Colors.grey[500],
+                    size: 20,
                   ),
                   filled: true,
-                  fillColor: !_isEditingRoomAndDate ? Colors.grey[200]?.withOpacity(0.6) : Colors.white,
+                  fillColor: !_isEditingRoomAndDate
+                      ? Colors.grey[200]?.withOpacity(0.6)
+                      : Colors.white,
                 ),
-                validator: (value) => value == null || value.trim().isEmpty ? 'Please enter month' : null,
+                items: _monthOptions
+                    .map(
+                      (monthLabel) => DropdownMenuItem<String>(
+                    value: monthLabel,
+                    child: Text(
+                      monthLabel,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                )
+                    .toList(),
+                onChanged: _isEditingRoomAndDate
+                    ? (value) {
+                  if (value == null) return;
+                  setState(() {
+                    _selectedMonth = value;
+                    _monthController.text = value;
+                  });
+                }
+                    : null,
+                validator: (value) => (value == null || value.trim().isEmpty)
+                    ? 'Please select month'
+                    : null,
               ),
               const SizedBox(height: 24),
 
